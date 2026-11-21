@@ -1253,3 +1253,494 @@ body {
   color: #9ca3af;
   font-size: 0.85rem;
 }
+
+
+/* ==========================================================================
+   Mobile & Responsive Layout (<= 768px and <= 480px)
+   ========================================================================== */
+
+button,
+input,
+select {
+  touch-action: manipulation;
+}
+
+.felt-strip-card,
+.declarer-dummy-card,
+.defender-row-card,
+.felt-bid-lvl-btn,
+.felt-bid-pass-btn,
+.felt-bid-mod-btn,
+.felt-strain-btn,
+.rail-menu-btn,
+.rail-claim-btn {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+@media (max-width: 768px) {
+  body {
+    overflow: auto;
+    min-height: 100dvh;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  .felt-shell {
+    flex-direction: column;
+    width: 100%;
+    min-height: 100dvh;
+    height: auto;
+  }
+
+  /* Convert vertical left rail into a compact top utility bar on mobile */
+  .felt-left-rail {
+    position: sticky;
+    top: 0;
+    width: 100%;
+    height: auto;
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 8px;
+    gap: 6px;
+    border-right: none;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+    z-index: 30;
+  }
+
+  .rail-menu-btn {
+    width: 42px;
+    height: 40px;
+    font-size: 1.15rem;
+    flex-shrink: 0;
+  }
+
+  .rail-board-box {
+    width: 46px;
+    height: 44px;
+    padding: 3px;
+    border-width: 4px;
+    flex-shrink: 0;
+  }
+
+  .rail-board-num {
+    font-size: 0.95rem;
+  }
+
+  .rail-board-dealer {
+    font-size: 0.62rem;
+    margin-top: 1px;
+  }
+
+  .rail-contract-box {
+    width: auto;
+    min-width: 66px;
+    flex: 1 1 auto;
+    max-width: 120px;
+    padding: 4px 6px;
+  }
+
+  .rail-contract-main {
+    font-size: 0.92rem;
+  }
+
+  .rail-contract-by {
+    font-size: 0.68rem;
+  }
+
+  .rail-tricks-box {
+    width: 56px;
+    padding: 4px 2px;
+    font-size: 0.88rem;
+    flex-shrink: 0;
+  }
+
+  .rail-claim-btn {
+    margin-top: 0;
+    width: auto;
+    min-width: 58px;
+    padding: 8px 10px;
+    font-size: 0.8rem;
+    flex-shrink: 0;
+  }
+
+  /* Anchor popovers cleanly below the mobile top bar */
+  .rail-hover-popover,
+  .board-scores-popover,
+  .contract-popover,
+  .trick-popover {
+    position: fixed;
+    top: 58px;
+    left: 8px;
+    right: 8px;
+    min-width: 0;
+    max-width: calc(100vw - 16px);
+    max-height: 70dvh;
+    overflow-y: auto;
+    z-index: 65;
+  }
+
+  .trick-mini-table {
+    width: 100%;
+    max-width: 240px;
+    height: 152px;
+  }
+
+  /* Stage allows vertical breathing room without clipping hands */
+  .felt-stage {
+    flex: 1 0 auto;
+    width: 100%;
+    min-height: calc(100dvh - 56px);
+    height: auto;
+    padding: 8px 8px 14px 8px;
+    gap: 8px;
+    overflow-x: hidden;
+    overflow-y: auto;
+  }
+
+  .felt-turn-notification {
+    position: static;
+    align-self: flex-end;
+    padding: 5px 10px;
+    font-size: 0.78rem;
+  }
+
+  .felt-toast-error {
+    position: fixed;
+    top: 60px;
+    left: 10px;
+    right: 10px;
+    transform: none;
+    text-align: center;
+    font-size: 0.8rem;
+  }
+
+  .felt-join-overlay {
+    width: 100%;
+    padding: 8px 0;
+  }
+
+  .felt-join-card {
+    min-width: 0;
+    width: 100%;
+    max-width: 420px;
+    margin: 0 auto;
+    padding: 18px 16px;
+  }
+
+  .felt-join-row {
+    flex-wrap: wrap;
+  }
+
+  .felt-join-row input {
+    flex: 1 1 130px;
+    min-width: 0;
+  }
+
+  .felt-join-row select {
+    min-height: 38px;
+  }
+
+  /* Top / Dummy seat */
+  .seat-zone-top {
+    max-width: 100%;
+    margin: 0 auto;
+    gap: 4px;
+  }
+
+  .felt-back-top {
+    height: 44px;
+  }
+
+  .felt-back-top .felt-back-strip {
+    width: 10px;
+  }
+
+  .declarer-dummy-card {
+    width: 24px;
+    height: 48px;
+    padding-top: 3px;
+    gap: 1px;
+  }
+
+  .declarer-dummy-rank {
+    font-size: 0.85rem;
+  }
+
+  .declarer-dummy-pip {
+    font-size: 0.78rem;
+  }
+
+  .defender-row-card {
+    width: 26px;
+    height: 28px;
+    padding: 0 1px;
+    gap: 1px;
+  }
+
+  .defender-row-rank {
+    font-size: 0.76rem;
+  }
+
+  .defender-row-pip {
+    font-size: 0.72rem;
+  }
+
+  /* Middle row stacks cleanly on narrow screens */
+  .seat-zone-middle {
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: flex-start;
+    gap: 8px;
+    margin: 2px 0;
+  }
+
+  .seat-zone-side {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    gap: 8px;
+  }
+
+  .felt-back-left,
+  .felt-back-right {
+    flex-direction: row;
+    width: auto;
+    height: 34px;
+  }
+
+  .felt-back-left .felt-back-strip,
+  .felt-back-right .felt-back-strip {
+    width: 10px;
+    height: 100%;
+    border-bottom: none;
+    border-right: 2px solid #ffffff;
+  }
+
+  .felt-back-left .felt-back-strip:last-child,
+  .felt-back-right .felt-back-strip:last-child {
+    border-right: none;
+  }
+
+  .felt-nameplate {
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  .felt-seat-tag {
+    padding: 3px 6px;
+    font-size: 0.82rem;
+  }
+
+  .felt-player-name {
+    padding: 3px 8px;
+    font-size: 0.8rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .center-table-area {
+    width: 100%;
+    gap: 8px;
+  }
+
+  /* Auction board & bidding panel on mobile */
+  .felt-auction-board {
+    width: 100%;
+    min-height: 132px;
+  }
+
+  .felt-auction-col-title {
+    font-size: 1rem;
+    padding: 3px 0;
+  }
+
+  .felt-auction-body {
+    padding: 6px;
+  }
+
+  .felt-auction-cell {
+    font-size: 0.95rem;
+  }
+
+  .felt-bidding-panel {
+    width: 100%;
+    padding: 6px;
+    gap: 6px;
+  }
+
+  .felt-bid-bar {
+    gap: 4px;
+  }
+
+  .felt-bid-pass-btn {
+    padding: 6px 10px;
+    font-size: 0.92rem;
+    min-height: 38px;
+  }
+
+  .felt-bid-lvl-btn {
+    flex: 1 1 34px;
+    width: auto;
+    min-width: 34px;
+    height: 38px;
+    font-size: 1rem;
+  }
+
+  .felt-bid-mod-btn {
+    height: 38px;
+    padding: 0 8px;
+    font-size: 0.85rem;
+  }
+
+  .felt-strain-btn {
+    flex: 1 1 42px;
+    min-height: 38px;
+    padding: 4px 6px;
+    font-size: 0.9rem;
+    text-align: center;
+  }
+
+  .felt-alert-inline {
+    flex: 1 1 100%;
+    min-height: 36px;
+  }
+
+  /* Trick stage on mobile */
+  .felt-trick-stage {
+    width: 220px;
+    height: 176px;
+  }
+
+  .felt-trick-card {
+    width: 58px;
+    height: 82px;
+    padding: 4px 5px;
+    border-radius: 5px;
+  }
+
+  .felt-trick-top,
+  .felt-trick-bottom {
+    font-size: 0.82rem;
+  }
+
+  .felt-trick-top.is-ten,
+  .felt-trick-bottom.is-ten {
+    font-size: 0.72rem;
+  }
+
+  .felt-trick-center {
+    font-size: 1.2rem;
+  }
+
+  /* Bottom 13-card player hand strip */
+  .seat-zone-bottom {
+    max-width: 100%;
+    margin-top: auto;
+  }
+
+  .felt-strip-row {
+    width: 100%;
+  }
+
+  .felt-strip-card {
+    height: 68px;
+    padding-top: 4px;
+    gap: 2px;
+  }
+
+  .felt-strip-rank {
+    font-size: 1.05rem;
+  }
+
+  .felt-strip-pip {
+    font-size: 0.95rem;
+  }
+
+  .felt-bottom-bar {
+    padding: 4px 6px;
+  }
+
+  .felt-bottom-user {
+    font-size: 0.82rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .felt-finished-bar {
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 8px;
+    font-size: 0.88rem;
+    padding: 8px 10px;
+  }
+
+  /* Full-width slide-over drawer on mobile */
+  .felt-drawer-panel {
+    margin-left: 0;
+    width: 100%;
+    max-width: 100vw;
+    padding: 14px 12px;
+  }
+
+  .felt-room-bar {
+    flex-wrap: wrap;
+  }
+
+  .felt-room-bar input {
+    flex: 1 1 140px;
+    min-width: 0;
+  }
+
+  .felt-claim-modal {
+    min-width: 0;
+    width: calc(100vw - 24px);
+    max-width: 360px;
+    padding: 16px;
+  }
+}
+
+@media (max-width: 480px) {
+  .rail-contract-box {
+    min-width: 54px;
+    max-width: 92px;
+  }
+
+  .declarer-dummy-card {
+    width: 21px;
+    height: 44px;
+  }
+
+  .declarer-dummy-rank {
+    font-size: 0.76rem;
+  }
+
+  .declarer-dummy-pip {
+    font-size: 0.7rem;
+  }
+
+  .felt-strip-card {
+    height: 62px;
+  }
+
+  .felt-strip-rank {
+    font-size: 0.92rem;
+  }
+
+  .felt-strip-pip {
+    font-size: 0.84rem;
+  }
+
+  .felt-trick-stage {
+    width: 196px;
+    height: 158px;
+  }
+
+  .felt-trick-card {
+    width: 50px;
+    height: 72px;
+  }
+}

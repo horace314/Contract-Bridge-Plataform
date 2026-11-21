@@ -566,6 +566,7 @@ export default function App() {
       playerName: trimmedName,
       reconnectToken,
     });
+    setDrawerOpen(false);
   };
 
   const sendBid = (call: BidCall) => {
@@ -723,6 +724,11 @@ export default function App() {
           className={`rail-board-box hover-anchor ${vulClass}`}
           onMouseEnter={() => setHoverBoardPopup(true)}
           onMouseLeave={() => setHoverBoardPopup(false)}
+          onClick={() => {
+            setHoverBoardPopup((prev) => !prev);
+            setHoverContractPopup(false);
+            setHoverLastTrickPopup(false);
+          }}
         >
           <div className="rail-board-inner">
             <div className="rail-board-num">{game?.boardNumber ?? 1}</div>
@@ -769,6 +775,11 @@ export default function App() {
           className="rail-contract-box hover-anchor"
           onMouseEnter={() => setHoverContractPopup(true)}
           onMouseLeave={() => setHoverContractPopup(false)}
+          onClick={() => {
+            setHoverContractPopup((prev) => !prev);
+            setHoverBoardPopup(false);
+            setHoverLastTrickPopup(false);
+          }}
         >
           <div className="rail-contract-main">
             {game?.contract ? (
@@ -828,6 +839,11 @@ export default function App() {
           className="rail-tricks-box hover-anchor"
           onMouseEnter={() => setHoverLastTrickPopup(true)}
           onMouseLeave={() => setHoverLastTrickPopup(false)}
+          onClick={() => {
+            setHoverLastTrickPopup((prev) => !prev);
+            setHoverBoardPopup(false);
+            setHoverContractPopup(false);
+          }}
         >
           <span>{game?.tricksWon.NS ?? 0}</span>
           <span>{game?.tricksWon.EW ?? 0}</span>

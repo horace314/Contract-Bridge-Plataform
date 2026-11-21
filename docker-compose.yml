@@ -1,0 +1,38 @@
+version: "3.9"
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bridge
+      POSTGRES_PASSWORD: bridgepassword
+      POSTGRES_DB: bridgedb
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./server/src/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  server:
+    build: ./server
+    environment:
+      PORT: 3001
+      DATABASE_URL: postgres://bridge:bridgepassword@postgres:5432/bridgedb
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "3001:3001"
+    depends_on:
+      - postgres
+      - redis
+
+  client:
+    build: ./client
+    environment:
+      VITE_SERVER_URL: http://localhost:3001
+    ports:
+      - "5173:5173"
+    depends_on:
+      - server

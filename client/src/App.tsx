@@ -102,17 +102,51 @@ interface CompletedBoardRecord {
   pbn: string;
 }
 
-type StagingRole = 'PLAYER' | 'MODERATOR';
 type LobbyModeTab = 'TOURNAMENT' | 'CASUAL';
 
-interface TournamentModeratorState {
-  moderatorName: string | null;
-  activeRound: number;
-  registrationOpen: boolean;
-  announcement: string;
+interface WallpaperPreset {
+  id: string;
+  label: string;
+  background: string;
+  swatchBackground: string;
 }
 
+const WALLPAPER_PRESETS: WallpaperPreset[] = [
+  {
+    id: 'green-felt',
+    label: 'Green Felt',
+    background: 'radial-gradient(circle at 50% 35%, #236347 0%, #174531 62%, #0f2e21 100%)',
+    swatchBackground: 'radial-gradient(circle at 50% 35%, #236347 0%, #15402d 100%)',
+  },
+  {
+    id: 'wood',
+    label: 'Wood',
+    background: 'radial-gradient(circle at 50% 35%, #7c4a27 0%, #593318 65%, #3b200e 100%)',
+    swatchBackground: 'radial-gradient(circle at 50% 35%, #7c4a27 0%, #4a2912 100%)',
+  },
+  {
+    id: 'dark',
+    label: 'Dark',
+    background: 'radial-gradient(circle at 50% 35%, #262b36 0%, #181c24 65%, #101319 100%)',
+    swatchBackground: 'radial-gradient(circle at 50% 35%, #262b36 0%, #13171e 100%)',
+  },
+  {
+    id: 'burgundy',
+    label: 'Burgundy',
+    background: 'radial-gradient(circle at 50% 35%, #662232 0%, #471521 65%, #2d0c14 100%)',
+    swatchBackground: 'radial-gradient(circle at 50% 35%, #662232 0%, #3b101a 100%)',
+  },
+  {
+    id: 'navy',
+    label: 'Navy',
+    background: 'radial-gradient(circle at 50% 35%, #1f3d66 0%, #142947 65%, #0c192e 100%)',
+    swatchBackground: 'radial-gradient(circle at 50% 35%, #1f3d66 0%, #11223b 100%)',
+  },
+];
+
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001';
+const PLAY_WALLPAPER_STORAGE_KEY = 'bridge_play_wallpaper';
+const PLAY_WALLPAPER_PRESET_STORAGE_KEY = 'bridge_play_wallpaper_preset';
 const SEATS: Seat[] = ['N', 'E', 'S', 'W'];
 const STRAIN_ORDER: Strain[] = ['C', 'D', 'H', 'S', 'NT'];
 const SEAT_FULL_NAME: Record<Seat, string> = {
@@ -398,11 +432,17 @@ function StripCardFace({
   disabled,
   onClick,
   highlighted,
+  style,
+  rankFontSize,
+  pipFontSize,
 }: {
   card: Card;
   disabled?: boolean;
   onClick?: () => void;
   highlighted?: boolean;
+  style?: React.CSSProperties;
+  rankFontSize?: string;
+  pipFontSize?: string;
 }) {
   const red = isRedSuit(card.suit);
   const sym = SUIT_SYM[card.suit];
@@ -412,13 +452,24 @@ function StripCardFace({
       type="button"
       disabled={disabled}
       onClick={onClick}
+      style={style}
       className={`felt-strip-card ${red ? 'suit-red' : 'suit-black'} ${
         !disabled && onClick ? 'playable' : ''
       } ${highlighted ? 'highlighted' : ''}`}
       title={`${lbl}${sym}`}
     >
-      <span className="felt-strip-rank">{lbl}</span>
-      <span className="felt-strip-pip">{sym}</span>
+      <span
+        className="felt-strip-rank"
+        style={rankFontSize ? { fontSize: rankFontSize } : undefined}
+      >
+        {lbl}
+      </span>
+      <span
+        className="felt-strip-pip"
+        style={pipFontSize ? { fontSize: pipFontSize } : undefined}
+      >
+        {sym}
+      </span>
     </button>
   );
 }
@@ -596,114 +647,6 @@ function ReplaySuitHandBox({
   );
 }
 
-type TournamentScoringType = 'MP' | 'IMP' | 'VP';
-type TournamentFormatType = 'PAIRS' | 'TEAMS';
-type TournamentMovementType = 'MITCHELL' | 'HOWELL' | 'SWISS' | 'ROUND_ROBIN';
-type ImpComparisonMode = 'HEAD_TO_HEAD' | 'CROSS_IMP' | 'DATUM_IMP';
-type VpScaleMode = 'WBF_CONTINUOUS_20' | 'WBF_STEPPED_25';
-
-interface TournamentSetupConfig {
-  id: string;
-  name: string;
-  format: TournamentFormatType;
-  scoringType: TournamentScoringType;
-  movement: TournamentMovementType;
-  numParticipants: number;
-  boardsPerRound: number;
-  numRounds: number;
-  minutesPerBoard: number;
-  usePreDuplicatedBoards: boolean;
-  sharedDeckSeed?: string;
-  moderatorPassword?: string;
-  impComparisonMode: ImpComparisonMode;
-  vpScaleMode: VpScaleMode;
-  mpAwardRule: '2_1_0' | '1_HALF_0';
-  tieBreakPrimary: 'NET_IMP' | 'HEAD_TO_HEAD' | 'MATCH_WINS' | 'MP_PCT';
-  tieBreakSecondary: 'NET_IMP' | 'HEAD_TO_HEAD' | 'MATCH_WINS' | 'MP_PCT';
-  createdAt: number;
-}
-
-function loadSavedTournamentConfigs(): TournamentSetupConfig[] {
-  const configs: TournamentSetupConfig[] = [];
-  const seenIds = new Set<string>();
-
-  const pushIfUnique = (cfg: TournamentSetupConfig | null | undefined) => {
-    if (!cfg || !cfg.name) return;
-    const key = cfg.id || cfg.name;
-    if (seenIds.has(key)) return;
-    seenIds.add(key);
-    configs.push(cfg);
-  };
-
-  try {
-    const activeRaw = localStorage.getItem('bridge_active_tournament_cfg');
-    if (activeRaw) {
-      pushIfUnique(JSON.parse(activeRaw));
-    }
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i);
-      if (k && k.startsWith('bridge_tournament_cfg_')) {
-        const raw = localStorage.getItem(k);
-        if (raw) {
-          pushIfUnique(JSON.parse(raw));
-        }
-      }
-    }
-  } catch {
-    // Ignore storage read errors
-  }
-
-  return configs;
-}
-
-function getTournamentRoomCode(cfg: TournamentSetupConfig): string {
-  const slug =
-    cfg.name
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-|-$/g, '') || 'bridge-tourney';
-  return `${slug}-${cfg.scoringType.toLowerCase()}`;
-}
-
-function getTournamentRoomCodesSet(configs: TournamentSetupConfig[]): Set<string> {
-  const codes = new Set<string>();
-  for (const cfg of configs) {
-    codes.add(getTournamentRoomCode(cfg));
-  }
-  try {
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i);
-      if (k && k.startsWith('bridge_tournament_cfg_')) {
-        codes.add(k.slice('bridge_tournament_cfg_'.length));
-      }
-    }
-  } catch {
-    // Ignore storage read errors
-  }
-  return codes;
-}
-
-interface TournamentLobbyParticipant {
-  id: string;
-  name: string;
-  teamName: string;
-  preferredSeat: Seat | 'ANY';
-  joinedAt: number;
-  isSelf?: boolean;
-}
-
-interface TournamentStagingLobby {
-  tournamentId: string;
-  roomCode: string;
-  config: TournamentSetupConfig;
-  teams: string[];
-  requiredSeats: number;
-  participants: TournamentLobbyParticipant[];
-  launchedToTable: boolean;
-  moderatorState?: TournamentModeratorState;
-}
-
 export default function App() {
   const [socket, setSocket] = useState<Socket | null>(null);
   const [connected, setConnected] = useState(false);
@@ -717,9 +660,130 @@ export default function App() {
   const [showNewRoomPassword, setShowNewRoomPassword] = useState(false);
   const [newRoomSeat, setNewRoomSeat] = useState<Seat>('S');
   const [availableRooms, setAvailableRooms] = useState<RoomSummary[]>([]);
+  const [viewportWidth, setViewportWidth] = useState<number>(() =>
+    typeof window !== 'undefined' ? window.innerWidth : 1200
+  );
 
-  const [moderatorAuthPromptOpen, setModeratorAuthPromptOpen] = useState(false);
-  const [moderatorAuthError, setModeratorAuthError] = useState('');
+  const [playWallpaper, setPlayWallpaper] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(PLAY_WALLPAPER_STORAGE_KEY);
+    } catch {
+      return null;
+    }
+  });
+  const [wallpaperPresetId, setWallpaperPresetId] = useState<string | null>(() => {
+    try {
+      const savedImg = localStorage.getItem(PLAY_WALLPAPER_STORAGE_KEY);
+      if (savedImg) return null;
+      const savedPreset = localStorage.getItem(PLAY_WALLPAPER_PRESET_STORAGE_KEY);
+      if (savedPreset && WALLPAPER_PRESETS.some((p) => p.id === savedPreset)) {
+        return savedPreset;
+      }
+      return 'green-felt';
+    } catch {
+      return 'green-felt';
+    }
+  });
+  const wallpaperObjectUrlRef = useRef<string | null>(null);
+  const wallpaperInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (wallpaperObjectUrlRef.current) {
+        URL.revokeObjectURL(wallpaperObjectUrlRef.current);
+        wallpaperObjectUrlRef.current = null;
+      }
+    };
+  }, []);
+
+  const selectWallpaperPreset = (presetId: string) => {
+    const matched = WALLPAPER_PRESETS.find((p) => p.id === presetId);
+    if (!matched) return;
+    if (wallpaperObjectUrlRef.current) {
+      URL.revokeObjectURL(wallpaperObjectUrlRef.current);
+      wallpaperObjectUrlRef.current = null;
+    }
+    setPlayWallpaper(null);
+    setWallpaperPresetId(matched.id);
+    try {
+      localStorage.removeItem(PLAY_WALLPAPER_STORAGE_KEY);
+      localStorage.setItem(PLAY_WALLPAPER_PRESET_STORAGE_KEY, matched.id);
+    } catch {
+      // Ignore storage errors
+    }
+  };
+
+  const applyWallpaperDataUrl = (dataUrl: string) => {
+    if (wallpaperObjectUrlRef.current) {
+      URL.revokeObjectURL(wallpaperObjectUrlRef.current);
+      wallpaperObjectUrlRef.current = null;
+    }
+    setWallpaperPresetId(null);
+    setPlayWallpaper(dataUrl);
+    try {
+      localStorage.removeItem(PLAY_WALLPAPER_PRESET_STORAGE_KEY);
+      localStorage.setItem(PLAY_WALLPAPER_STORAGE_KEY, dataUrl);
+    } catch {
+      setErrorMsg('Wallpaper applied for this session (image too large to save in browser storage).');
+    }
+  };
+
+  const handleWallpaperFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+
+    if (!file.type.startsWith('image/')) {
+      setErrorMsg('Please choose a valid image file (PNG, JPG, WebP, etc.).');
+      return;
+    }
+
+    if (file.size > 2_500_000) {
+      if (wallpaperObjectUrlRef.current) {
+        URL.revokeObjectURL(wallpaperObjectUrlRef.current);
+      }
+      const objUrl = URL.createObjectURL(file);
+      wallpaperObjectUrlRef.current = objUrl;
+      setWallpaperPresetId(null);
+      setPlayWallpaper(objUrl);
+      setErrorMsg('Large image applied for this session only (over 2.5 MB is not saved across reloads).');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result === 'string') {
+        applyWallpaperDataUrl(reader.result);
+      }
+    };
+    reader.onerror = () => {
+      setErrorMsg('Could not read the selected image file.');
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const clearWallpaper = () => {
+    if (wallpaperObjectUrlRef.current) {
+      URL.revokeObjectURL(wallpaperObjectUrlRef.current);
+      wallpaperObjectUrlRef.current = null;
+    }
+    setPlayWallpaper(null);
+    setWallpaperPresetId('green-felt');
+    try {
+      localStorage.removeItem(PLAY_WALLPAPER_STORAGE_KEY);
+      localStorage.setItem(PLAY_WALLPAPER_PRESET_STORAGE_KEY, 'green-felt');
+    } catch {
+      // Ignore storage errors
+    }
+  };
+
+  useEffect(() => {
+    const handleResize = () => {
+      setViewportWidth(window.innerWidth);
+    };
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
 
   useEffect(() => {
     tableIdRef.current = tableId;
@@ -736,8 +800,15 @@ export default function App() {
       // Ignore if endpoint unreachable
     }
   };
+
   const [selectedSeat, setSelectedSeat] = useState<Seat>('S');
-  const [playerNameInput, setPlayerNameInput] = useState('');
+  const [playerNameInput, setPlayerNameInput] = useState(() => {
+    try {
+      return localStorage.getItem('bridge_player_name') || '';
+    } catch {
+      return '';
+    }
+  });
   const [seatNames, setSeatNames] = useState<Partial<Record<Seat, string>>>({});
   const [mySeat, setMySeat] = useState<Seat | null>(null);
   const [game, setGame] = useState<GameState | null>(null);
@@ -774,11 +845,6 @@ export default function App() {
   const [revealedCardStep, setRevealedCardStep] = useState<number>(4);
   const [showClaimSummary, setShowClaimSummary] = useState<boolean>(false);
   const [chatOpen, setChatOpen] = useState(false);
-  const [tournamentModalOpen, setTournamentModalOpen] = useState(false);
-  const [tournamentList] = useState<TournamentSetupConfig[]>(() =>
-    loadSavedTournamentConfigs()
-  );
-  const [stagingLobby, setStagingLobby] = useState<TournamentStagingLobby | null>(null);
 
   useEffect(() => {
     if (lobbyTab === 'TOURNAMENT') {
@@ -836,15 +902,6 @@ export default function App() {
         setScoreModalOpen(false);
         return;
       }
-      if (tournamentModalOpen) {
-        setTournamentModalOpen(false);
-        return;
-      }
-      if (moderatorAuthPromptOpen) {
-        setModeratorAuthPromptOpen(false);
-        setModeratorAuthError('');
-        return;
-      }
       if (chatOpen) {
         setChatOpen(false);
         return;
@@ -862,8 +919,6 @@ export default function App() {
     historyModalBoard,
     drawerOpen,
     scoreModalOpen,
-    tournamentModalOpen,
-    moderatorAuthPromptOpen,
     chatOpen,
   ]);
 
@@ -983,27 +1038,6 @@ export default function App() {
 
     s.on('error_msg', (msg: string) => {
       setErrorMsg(msg);
-    });
-
-    s.on('tournament_staging_update', (payload: TournamentStagingLobby) => {
-      if (!payload || !Array.isArray(payload.participants)) return;
-      const reqCount = payload.requiredSeats || 4;
-      const filled = payload.participants.length >= reqCount;
-      const isModeratorSelf =
-        Boolean(payload.moderatorState?.moderatorName) &&
-        payload.moderatorState?.moderatorName ===
-          (playerNameInput.trim() || 'Tournament Director');
-      if (filled && !isModeratorSelf) {
-        const chosenSeat: Seat =
-          payload.participants.find((p) => p.isSelf)?.preferredSeat &&
-          payload.participants.find((p) => p.isSelf)?.preferredSeat !== 'ANY'
-            ? (payload.participants.find((p) => p.isSelf)!.preferredSeat as Seat)
-            : 'S';
-        setStagingLobby(null);
-        joinSeat(chosenSeat, payload.roomCode);
-      } else {
-        setStagingLobby({ ...payload, requiredSeats: reqCount, launchedToTable: false });
-      }
     });
 
     return () => {
@@ -1377,6 +1411,62 @@ export default function App() {
   const leftIsFaceUp = leftCards.some((c) => c.rank > 0);
   const rightCards = game?.hands[rightSeat] || [];
   const rightIsFaceUp = rightCards.some((c) => c.rank > 0);
+
+  const isCompactPortrait = viewportWidth <= 768;
+  const isWideScreen = viewportWidth >= 1100;
+  const bottomCardCount = bottomCards.length;
+  const bottomGapPx = isCompactPortrait ? 2 : isWideScreen ? 4 : 1;
+  const availHandWidth = Math.max(
+    isCompactPortrait
+      ? viewportWidth - 24
+      : isWideScreen
+      ? viewportWidth - 180
+      : viewportWidth - 140,
+    220
+  );
+  const wideCardWidthPx =
+    bottomCardCount > 0
+      ? Math.max(
+          56,
+          Math.min(
+            96,
+            Math.floor(
+              (availHandWidth - Math.max(0, bottomCardCount - 1) * bottomGapPx) /
+                bottomCardCount
+            )
+          )
+        )
+      : 72;
+  const wideCardHeightPx = Math.round(wideCardWidthPx * 1.45);
+  const compactCardWidthPx =
+    bottomCardCount > 0 && isCompactPortrait
+      ? Math.max(
+          20,
+          Math.min(
+            56,
+            Math.floor(
+              (availHandWidth - Math.max(0, bottomCardCount - 1) * bottomGapPx) /
+                bottomCardCount
+            )
+          )
+        )
+      : wideCardWidthPx;
+  const compactCardHeightPx = isCompactPortrait
+    ? Math.round(compactCardWidthPx * 1.45)
+    : wideCardHeightPx;
+  const wideRankFontRem = Math.max(
+    1.65,
+    Math.min(2.4, Number((wideCardWidthPx * 0.025).toFixed(2)))
+  );
+  const widePipFontRem = Math.max(
+    1.45,
+    Math.min(2.1, Number((wideCardWidthPx * 0.022).toFixed(2)))
+  );
+  const bottomStripWidthPx =
+    bottomCardCount > 0
+      ? bottomCardCount * compactCardWidthPx +
+        Math.max(0, bottomCardCount - 1) * bottomGapPx
+      : 0;
 
   const displayNameForSeat = (seat: Seat) => {
     if (seatNames[seat]) return seatNames[seat]!;
@@ -1995,7 +2085,28 @@ export default function App() {
         </aside>
       )}
 
-      <main className="felt-stage" style={{ boxSizing: 'border-box', overflowX: 'hidden', minWidth: 0 }}>
+      <main
+        className="felt-stage"
+        style={{
+          boxSizing: 'border-box',
+          overflowX: 'hidden',
+          minWidth: 0,
+          ...(playWallpaper
+            ? {
+                backgroundImage: `linear-gradient(rgba(10, 28, 20, 0.28), rgba(10, 28, 20, 0.36)), url("${playWallpaper}")`,
+                backgroundSize: 'cover',
+                backgroundPosition: 'center',
+                backgroundRepeat: 'no-repeat',
+              }
+            : wallpaperPresetId
+            ? {
+                background:
+                  WALLPAPER_PRESETS.find((p) => p.id === wallpaperPresetId)?.background ||
+                  WALLPAPER_PRESETS[0].background,
+              }
+            : undefined),
+        }}
+      >
         {errorMsg && <div className="felt-toast-error">{errorMsg}</div>}
 
         {!game ? (
@@ -2113,13 +2224,7 @@ export default function App() {
                       cursor: 'pointer',
                     }}
                   >
-                    ♠ Casual Play (
-                    {
-                      availableRooms.filter(
-                        (r) => !getTournamentRoomCodesSet(tournamentList).has(r.id)
-                      ).length
-                    }
-                    )
+                    ♠ Casual Play ({availableRooms.length})
                   </button>
                 </div>
               </div>
@@ -2208,13 +2313,7 @@ export default function App() {
                         color: '#143828',
                       }}
                     >
-                      Casual Rooms (
-                      {
-                        availableRooms.filter(
-                          (r) => !getTournamentRoomCodesSet(tournamentList).has(r.id)
-                        ).length
-                      }
-                      )
+                      Casual Rooms ({availableRooms.length})
                     </strong>
                     <div style={{ display: 'flex', gap: 6 }}>
                       <button
@@ -2268,9 +2367,7 @@ export default function App() {
                     </div>
                   </div>
 
-                  {availableRooms.filter(
-                    (r) => !getTournamentRoomCodesSet(tournamentList).has(r.id)
-                  ).length === 0 ? (
+                  {availableRooms.length === 0 ? (
                     <div
                       style={{
                         flex: 1,
@@ -2301,125 +2398,121 @@ export default function App() {
                           overflowY: 'auto',
                         }}
                       >
-                        {availableRooms
-                          .filter((r) => !getTournamentRoomCodesSet(tournamentList).has(r.id))
-                          .map((r) => {
-                            const isSelected = tableId === r.id;
-                            return (
+                        {availableRooms.map((r) => {
+                          const isSelected = tableId === r.id;
+                          return (
+                            <div
+                              key={r.id}
+                              onClick={() => setTableId(r.id)}
+                              style={{
+                                padding: '10px 12px',
+                                borderRadius: 8,
+                                border: isSelected
+                                  ? '2px solid #ca8a04'
+                                  : '1px solid #d6cfc2',
+                                background: isSelected ? '#fef9c3' : '#ffffff',
+                                color: '#1e293b',
+                                cursor: 'pointer',
+                                transition: 'all 0.15s ease',
+                              }}
+                            >
                               <div
-                                key={r.id}
-                                onClick={() => setTableId(r.id)}
                                 style={{
-                                  padding: '10px 12px',
-                                  borderRadius: 8,
-                                  border: isSelected
-                                    ? '2px solid #ca8a04'
-                                    : '1px solid #d6cfc2',
-                                  background: isSelected
-                                    ? '#fef9c3'
-                                    : '#ffffff',
-                                  color: '#1e293b',
-                                  cursor: 'pointer',
-                                  transition: 'all 0.15s ease',
+                                  display: 'flex',
+                                  justifyContent: 'space-between',
+                                  alignItems: 'center',
+                                  marginBottom: 6,
                                 }}
                               >
-                                <div
-                                  style={{
-                                    display: 'flex',
-                                    justifyContent: 'space-between',
-                                    alignItems: 'center',
-                                    marginBottom: 6,
-                                  }}
-                                >
-                                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                                    <strong
-                                      style={{
-                                        fontSize: 14,
-                                        color: isSelected ? '#854d0e' : '#0f172a',
-                                      }}
-                                    >
-                                      {r.id}
-                                    </strong>
-                                    {r.hasPassword && (
-                                      <span
-                                        title="Password protected"
-                                        style={{
-                                          fontSize: 11.5,
-                                          padding: '1px 6px',
-                                          borderRadius: 4,
-                                          background: '#fef3c7',
-                                          color: '#92400e',
-                                          border: '1px solid #f59e0b',
-                                        }}
-                                      >
-                                        🔒 Locked
-                                      </span>
-                                    )}
-                                  </div>
-                                  <span
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                  <strong
                                     style={{
-                                      fontSize: 12,
-                                      fontVariantNumeric: 'tabular-nums',
-                                      color: '#475569',
+                                      fontSize: 14,
+                                      color: isSelected ? '#854d0e' : '#0f172a',
                                     }}
                                   >
-                                    Board #{r.boardNumber} · {r.occupiedCount}/4 seated
-                                  </span>
+                                    {r.id}
+                                  </strong>
+                                  {r.hasPassword && (
+                                    <span
+                                      title="Password protected"
+                                      style={{
+                                        fontSize: 11.5,
+                                        padding: '1px 6px',
+                                        borderRadius: 4,
+                                        background: '#fef3c7',
+                                        color: '#92400e',
+                                        border: '1px solid #f59e0b',
+                                      }}
+                                    >
+                                      🔒 Locked
+                                    </span>
+                                  )}
                                 </div>
-
-                                <div
+                                <span
                                   style={{
-                                    display: 'grid',
-                                    gridTemplateColumns: 'repeat(4, 1fr)',
-                                    gap: 5,
+                                    fontSize: 12,
+                                    fontVariantNumeric: 'tabular-nums',
+                                    color: '#475569',
                                   }}
                                 >
-                                  {SEATS.map((s) => {
-                                    const occupant = r.seats?.[s];
-                                    const seatSelected = isSelected && selectedSeat === s;
-                                    return (
-                                      <button
-                                        key={s}
-                                        type="button"
-                                        disabled={Boolean(occupant)}
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          setTableId(r.id);
-                                          setSelectedSeat(s);
-                                        }}
-                                        title={
-                                          occupant
-                                            ? `${SEAT_FULL_NAME[s]} occupied by ${occupant}`
-                                            : `Select ${SEAT_FULL_NAME[s]} (${s})`
-                                        }
-                                        style={{
-                                          padding: '4px 6px',
-                                          borderRadius: 5,
-                                          fontFamily: UI_FONT_FAMILY,
-                                          fontSize: 11.5,
-                                          border: seatSelected
-                                            ? '1.5px solid #ca8a04'
-                                            : '1px solid #cbd5e1',
-                                          background: occupant
-                                            ? '#f1f5f9'
-                                            : seatSelected
-                                            ? '#fde047'
-                                            : '#dcfce7',
-                                          color: occupant ? '#64748b' : '#14532d',
-                                          cursor: occupant ? 'not-allowed' : 'pointer',
-                                          whiteSpace: 'nowrap',
-                                          overflow: 'hidden',
-                                          textOverflow: 'ellipsis',
-                                        }}
-                                      >
-                                        <strong>{s}:</strong> {occupant || 'Open'}
-                                      </button>
-                                    );
-                                  })}
-                                </div>
+                                  Board #{r.boardNumber} · {r.occupiedCount}/4 seated
+                                </span>
                               </div>
-                            );
-                          })}
+
+                              <div
+                                style={{
+                                  display: 'grid',
+                                  gridTemplateColumns: 'repeat(4, 1fr)',
+                                  gap: 5,
+                                }}
+                              >
+                                {SEATS.map((s) => {
+                                  const occupant = r.seats?.[s];
+                                  const seatSelected = isSelected && selectedSeat === s;
+                                  return (
+                                    <button
+                                      key={s}
+                                      type="button"
+                                      disabled={Boolean(occupant)}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setTableId(r.id);
+                                        setSelectedSeat(s);
+                                      }}
+                                      title={
+                                        occupant
+                                          ? `${SEAT_FULL_NAME[s]} occupied by ${occupant}`
+                                          : `Select ${SEAT_FULL_NAME[s]} (${s})`
+                                      }
+                                      style={{
+                                        padding: '4px 6px',
+                                        borderRadius: 5,
+                                        fontFamily: UI_FONT_FAMILY,
+                                        fontSize: 11.5,
+                                        border: seatSelected
+                                          ? '1.5px solid #ca8a04'
+                                          : '1px solid #cbd5e1',
+                                        background: occupant
+                                          ? '#f1f5f9'
+                                          : seatSelected
+                                          ? '#fde047'
+                                          : '#dcfce7',
+                                        color: occupant ? '#64748b' : '#14532d',
+                                        cursor: occupant ? 'not-allowed' : 'pointer',
+                                        whiteSpace: 'nowrap',
+                                        overflow: 'hidden',
+                                        textOverflow: 'ellipsis',
+                                      }}
+                                    >
+                                      <strong>{s}:</strong> {occupant || 'Open'}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          );
+                        })}
                       </div>
 
                       <div
@@ -2504,18 +2597,8 @@ export default function App() {
                           <button
                             type="button"
                             onClick={() => {
-                              const targetId =
-                                tableId ||
-                                availableRooms.filter(
-                                  (r) => !getTournamentRoomCodesSet(tournamentList).has(r.id)
-                                )[0]?.id;
+                              const targetId = tableId || availableRooms[0]?.id;
                               if (!targetId) return;
-                              if (getTournamentRoomCodesSet(tournamentList).has(targetId)) {
-                                setErrorMsg(
-                                  'Tournament rooms are currently a work in progress.'
-                                );
-                                return;
-                              }
                               joinSeat(selectedSeat, targetId);
                             }}
                             style={{
@@ -2663,12 +2746,6 @@ export default function App() {
                     onClick={() => {
                       const createdId = newRoomName.trim();
                       if (!createdId) return;
-                      if (getTournamentRoomCodesSet(tournamentList).has(createdId)) {
-                        setErrorMsg(
-                          'Tournament rooms are currently a work in progress.'
-                        );
-                        return;
-                      }
                       setTableId(createdId);
                       setSelectedSeat(newRoomSeat);
                       setRoomPasswordInput(newRoomPassword);
@@ -2713,8 +2790,38 @@ export default function App() {
               </div>
             </div>
 
-            <div className="seat-zone-middle">
-              <div className="seat-zone-side">
+            <div
+              className="seat-zone-middle"
+              style={
+                isCompactPortrait
+                  ? {
+                      display: 'grid',
+                      gridTemplateColumns: 'minmax(44px, 68px) minmax(0, 1fr) minmax(44px, 68px)',
+                      alignItems: 'center',
+                      gap: 4,
+                      width: '100%',
+                      minWidth: 0,
+                    }
+                  : undefined
+              }
+            >
+              <div
+                className="seat-zone-side seat-zone-left"
+                style={
+                  isCompactPortrait
+                    ? {
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        gap: 4,
+                        minWidth: 0,
+                        maxWidth: '100%',
+                        overflow: 'hidden',
+                      }
+                    : undefined
+                }
+              >
                 {leftIsFaceUp || isClaimRevealed ? (
                   <HorizontalSuitHand
                     cards={leftCards}
@@ -2737,6 +2844,18 @@ export default function App() {
                         : 'active-turn'
                       : ''
                   }`}
+                  style={
+                    isCompactPortrait
+                      ? {
+                          maxWidth: '100%',
+                          fontSize: 10.5,
+                          padding: '2px 5px',
+                          whiteSpace: 'nowrap',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                        }
+                      : undefined
+                  }
                 >
                   <span className="felt-seat-tag">{leftSeat}</span>
                   <span className="felt-player-name">{formatSeatLabel(leftSeat)}</span>
@@ -2744,7 +2863,21 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="center-table-area">
+              <div
+                className="center-table-area"
+                style={
+                  isCompactPortrait
+                    ? {
+                        minWidth: 0,
+                        width: '100%',
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                      }
+                    : undefined
+                }
+              >
                 {game && game.phase !== 'FINISHED' && (
                   <div className={`felt-turn-notification ${isMyTurn ? 'my-turn-notify' : ''}`}>
                     <span className="turn-notify-dot">●</span>
@@ -2944,7 +3077,23 @@ export default function App() {
                 )}
               </div>
 
-              <div className="seat-zone-side">
+              <div
+                className="seat-zone-side seat-zone-right"
+                style={
+                  isCompactPortrait
+                    ? {
+                        display: 'flex',
+                        flexDirection: 'column',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        gap: 4,
+                        minWidth: 0,
+                        maxWidth: '100%',
+                        overflow: 'hidden',
+                      }
+                    : undefined
+                }
+              >
                 {rightIsFaceUp || isClaimRevealed ? (
                   <HorizontalSuitHand
                     cards={rightCards}
@@ -2967,6 +3116,18 @@ export default function App() {
                         : 'active-turn'
                       : ''
                   }`}
+                  style={
+                    isCompactPortrait
+                      ? {
+                          maxWidth: '100%',
+                          fontSize: 10.5,
+                          padding: '2px 5px',
+                          whiteSpace: 'nowrap',
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                        }
+                      : undefined
+                  }
                 >
                   <span className="felt-seat-tag">{rightSeat}</span>
                   <span className="felt-player-name">{formatSeatLabel(rightSeat)}</span>
@@ -2989,7 +3150,16 @@ export default function App() {
               ) : (
                 <div
                   className="felt-strip-row bottom-hand-strip"
-                  style={{ width: `${Math.max(bottomCards.length, 0) * 56}px` }}
+                  style={{
+                    width: bottomStripWidthPx > 0 ? `${bottomStripWidthPx}px` : 'fit-content',
+                    maxWidth: '100%',
+                    minWidth: 0,
+                    gap: `${bottomGapPx}px`,
+                    display: 'flex',
+                    alignItems: 'stretch',
+                    justifyContent: 'center',
+                    overflow: 'hidden',
+                  }}
                 >
                   {bottomCards.map((c, idx) => (
                     <StripCardFace
@@ -3001,6 +3171,21 @@ export default function App() {
                       }
                       onClick={() => sendCard(c)}
                       highlighted={game.currentTurn === bottomSeat}
+                      rankFontSize={isWideScreen ? `${wideRankFontRem}rem` : undefined}
+                      pipFontSize={isWideScreen ? `${widePipFontRem}rem` : undefined}
+                      style={
+                        isCompactPortrait || isWideScreen
+                          ? {
+                              flex: `0 0 ${compactCardWidthPx}px`,
+                              width: `${compactCardWidthPx}px`,
+                              minWidth: `${compactCardWidthPx}px`,
+                              maxWidth: `${compactCardWidthPx}px`,
+                              height: `${compactCardHeightPx}px`,
+                              padding: isWideScreen ? '6px 3px' : '3px 1px',
+                              gap: isWideScreen ? '4px' : '2px',
+                            }
+                          : undefined
+                      }
                     />
                   ))}
                 </div>
@@ -3592,6 +3777,106 @@ export default function App() {
                   </div>
                 )}
 
+                <div
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 8,
+                    marginTop: 8,
+                    padding: 8,
+                    borderRadius: 8,
+                    background: 'rgba(0, 0, 0, 0.25)',
+                    border: '1px solid rgba(255, 255, 255, 0.14)',
+                  }}
+                >
+                  <div style={{ fontSize: 12, fontWeight: 600 }}>Play Area Wallpaper</div>
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                    {WALLPAPER_PRESETS.map((preset) => {
+                      const isActivePreset = !playWallpaper && wallpaperPresetId === preset.id;
+                      return (
+                        <button
+                          key={preset.id}
+                          type="button"
+                          onClick={() => selectWallpaperPreset(preset.id)}
+                          title={`${preset.label} wallpaper`}
+                          style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: 6,
+                            padding: '4px 8px',
+                            borderRadius: 6,
+                            border: isActivePreset
+                              ? '1.5px solid #facc15'
+                              : '1px solid rgba(255, 255, 255, 0.2)',
+                            background: isActivePreset
+                              ? 'rgba(250, 204, 21, 0.18)'
+                              : 'rgba(255, 255, 255, 0.06)',
+                            color: isActivePreset ? '#fef08a' : '#f8fafc',
+                            fontSize: 11.5,
+                            fontWeight: isActivePreset ? 700 : 500,
+                            cursor: 'pointer',
+                          }}
+                        >
+                          <span
+                            style={{
+                              width: 12,
+                              height: 12,
+                              borderRadius: 3,
+                              background: preset.swatchBackground,
+                              border: '1px solid rgba(255, 255, 255, 0.35)',
+                              flexShrink: 0,
+                            }}
+                          />
+                          <span>{preset.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <input
+                    ref={wallpaperInputRef}
+                    type="file"
+                    accept="image/*"
+                    onChange={handleWallpaperFileChange}
+                    style={{ display: 'none' }}
+                  />
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      onClick={() => wallpaperInputRef.current?.click()}
+                      style={{
+                        padding: '5px 10px',
+                        borderRadius: 6,
+                        border: '1px solid rgba(250, 204, 21, 0.65)',
+                        background: 'rgba(250, 204, 21, 0.18)',
+                        color: '#fef08a',
+                        fontSize: 11.5,
+                        fontWeight: 600,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      Upload Image
+                    </button>
+                    {playWallpaper && (
+                      <button
+                        type="button"
+                        onClick={clearWallpaper}
+                        style={{
+                          padding: '5px 10px',
+                          borderRadius: 6,
+                          border: '1px solid rgba(255, 255, 255, 0.22)',
+                          background: 'rgba(255, 255, 255, 0.08)',
+                          color: '#f8fafc',
+                          fontSize: 11.5,
+                          fontWeight: 600,
+                          cursor: 'pointer',
+                        }}
+                      >
+                        Reset Felt
+                      </button>
+                    )}
+                  </div>
+                </div>
+
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 8 }}>
                   <div
                     style={{
@@ -3619,19 +3904,12 @@ export default function App() {
                       overflowY: 'auto',
                     }}
                   >
-                    {(() => {
-                      const tournamentRoomCodes = getTournamentRoomCodesSet(tournamentList);
-                      const standardDrawerRooms = availableRooms.filter(
-                        (r) => !tournamentRoomCodes.has(r.id)
-                      );
-                      if (standardDrawerRooms.length === 0) {
-                        return (
-                          <div style={{ fontSize: 11.5, opacity: 0.8, padding: '6px 4px' }}>
-                            No active rooms. Create a room from the lobby.
-                          </div>
-                        );
-                      }
-                      return standardDrawerRooms.map((r) => {
+                    {availableRooms.length === 0 ? (
+                      <div style={{ fontSize: 11.5, opacity: 0.8, padding: '6px 4px' }}>
+                        No active rooms. Create a room from the lobby.
+                      </div>
+                    ) : (
+                      availableRooms.map((r) => {
                         const active = tableId === r.id;
                         return (
                           <button
@@ -3660,8 +3938,8 @@ export default function App() {
                             <span style={{ opacity: 0.8 }}>{r.occupiedCount}/4</span>
                           </button>
                         );
-                      });
-                    })()}
+                      })
+                    )}
                   </div>
                 </div>
 
@@ -3707,15 +3985,7 @@ export default function App() {
                   <button
                     type="button"
                     className="rail-claim-btn"
-                    onClick={() => {
-                      if (getTournamentRoomCodesSet(tournamentList).has(tableId.trim())) {
-                        setErrorMsg(
-                          'Tournament rooms are currently a work in progress.'
-                        );
-                        return;
-                      }
-                      joinSeat(selectedSeat);
-                    }}
+                    onClick={() => joinSeat(selectedSeat)}
                   >
                     Sit
                   </button>
@@ -3736,24 +4006,6 @@ export default function App() {
                     <span style={{ fontSize: 12, opacity: 0.85 }}>
                       Room: <strong>{tableId}</strong>
                     </span>
-                    <button
-                      type="button"
-                      disabled
-                      aria-disabled="true"
-                      title="Tournament mode is currently a work in progress"
-                      style={{
-                        padding: '6px 10px',
-                        borderRadius: 6,
-                        border: '1px solid rgba(255, 255, 255, 0.2)',
-                        background: 'rgba(255, 255, 255, 0.06)',
-                        color: 'rgba(255, 255, 255, 0.5)',
-                        fontSize: 12,
-                        fontWeight: 600,
-                        cursor: 'not-allowed',
-                      }}
-                    >
-                      Tournament (WIP)
-                    </button>
                     <button
                       type="button"
                       onClick={leaveTable}

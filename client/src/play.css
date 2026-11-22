@@ -614,6 +614,7 @@ body {
   flex-direction: column;
   align-items: flex-start;
   gap: 6px;
+  flex: 0 0 auto;
 }
 
 .center-table-area {
@@ -743,8 +744,8 @@ body {
 }
 
 .felt-auction-board {
-  width: 390px;
-  max-width: 100%;
+  width: min(390px, 100%);
+  min-width: 240px;
   min-height: 176px;
   background: #b8c7ce;
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.32);
@@ -953,8 +954,11 @@ body {
   position: relative;
   z-index: 6;
   flex-shrink: 0;
-  width: fit-content;
+  width: 100%;
   max-width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
   margin: 4px auto 0 auto;
   border: 3px solid transparent;
   border-radius: 5px;
@@ -967,6 +971,8 @@ body {
 
 .felt-strip-row {
   display: flex;
+  align-items: stretch;
+  justify-content: center;
   max-width: 100%;
   background: #ffffff;
   border-radius: 2px;
@@ -1018,6 +1024,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  width: 100%;
   background: #d9dee2;
   padding: 4px 8px;
   border-radius: 0 0 3px 3px;
@@ -1028,6 +1035,7 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
 }
 
 .felt-player-icon {
@@ -1036,6 +1044,7 @@ body {
   border-radius: 4px;
   padding: 0 3px;
   font-size: 0.95rem;
+  flex-shrink: 0;
 }
 
 .felt-player-icon.turn-yellow {
@@ -1047,6 +1056,9 @@ body {
   font-weight: 600;
   font-size: 0.95rem;
   color: #111827;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .felt-finished-bar {
@@ -1471,6 +1483,7 @@ select {
 
   .felt-auction-board {
     width: 100%;
+    min-width: 0;
     min-height: 132px;
   }
 
@@ -1557,26 +1570,36 @@ select {
   }
 
   .seat-zone-bottom {
+    width: 100%;
     max-width: 100%;
     margin-top: auto;
   }
 
   .felt-strip-row {
-    width: 100%;
+    width: fit-content;
+    max-width: 100%;
   }
 
   .felt-strip-card {
-    height: 68px;
-    padding-top: 4px;
+    flex: 0 0 auto;
+    min-width: 20px;
+    height: 64px;
+    padding: 3px 1px;
     gap: 2px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: flex-start;
   }
 
   .felt-strip-rank {
-    font-size: 1.05rem;
+    font-size: 0.88rem;
+    line-height: 1.05;
   }
 
   .felt-strip-pip {
-    font-size: 0.95rem;
+    font-size: 0.8rem;
+    line-height: 1.05;
   }
 
   .felt-bottom-bar {
@@ -1642,15 +1665,18 @@ select {
   }
 
   .felt-strip-card {
-    height: 62px;
+    flex: 0 0 auto;
+    min-width: 18px;
+    height: 58px;
+    padding: 3px 1px;
   }
 
   .felt-strip-rank {
-    font-size: 0.92rem;
+    font-size: 0.78rem;
   }
 
   .felt-strip-pip {
-    font-size: 0.84rem;
+    font-size: 0.72rem;
   }
 
   .felt-trick-stage {

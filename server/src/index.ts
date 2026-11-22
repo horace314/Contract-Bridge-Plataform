@@ -20,6 +20,15 @@ import {
   sanitizeStateForSeat,
   Seat,
 } from './bridgeEngine';
+import {
+  addBotSeat,
+  clearBotTimer,
+  fillOpenSeatsWithBots,
+  registerBotSocketHandlers,
+  removeBotSeat,
+  scheduleBotTurn,
+  type BridgeRoom,
+} from './botServer';
 
 const PORT = Number(process.env.PORT || 3001);
 const app = express();
@@ -64,57 +73,61 @@ export interface ChatMessage {
   timestamp: number;
 }
 
-interface TableRoom {
+interface TableRoom extends BridgeRoom {
   id: string;
   password?: string;
   seats: Partial<Record<Seat, SeatSession>>;
   game: GameState;
+  botSeats: Set<Seat>;
+  botTimer?: ReturnType<typeof setTimeout> | null;
   chatMessages: ChatMessage[];
 }
 
 const rooms = new Map<string, TableRoom>();
 const memoryBoards = new Map<string, any[]>();
 const ALL_SEATS: Seat[] = ['N', 'E', 'S', 'W'];
+const SEAT_FULL_NAME: Record<Seat, string> = {
+  N: 'North',
+  E: 'East',
+  S: 'South',
+  W: 'West',
+};
 
-function getOrCreateRoom(tableId: string, password?: string): TableRoom {
-  let room = rooms.get(tableId);
-  if (!room) {
-    const cleanPw =
-      typeof password === 'string' && password.trim().length > 0
-        ? password.trim()
-        : undefined;
-    room = {
-      id: tableId,
-      password: cleanPw,
-      seats: {},
-      game: createNewBoard(1),
-      chatMessages: [],
-    };
-    rooms.set(tableId, room);
-  }
-  return room;
-}
-
-function getOccupiedCount(room: TableRoom): number {
-  let count = 0;
+function getSeatNames(room: TableRoom): Partial<Record<Seat, string>> {
+  const names: Partial<Record<Seat, string>> = {};
   for (const s of ALL_SEATS) {
-    if (room.seats[s]?.playerName) {
-      count += 1;
+    if (room.botSeats?.has(s)) {
+      names[s] = room.seats[s]?.playerName || `Bot ${SEAT_FULL_NAME[s]}`;
+    } else if (room.seats[s]?.playerName) {
+      names[s] = room.seats[s]!.playerName;
     }
   }
-  return count;
+  return names;
 }
 
-function cleanupEmptyRooms(): string[] {
-  const removed: string[] = [];
-  for (const [roomId, room] of Array.from(rooms.entries())) {
-    const connectedInRoom = io.sockets.adapter.rooms.get(roomId)?.size ?? 0;
-    if (getOccupiedCount(room) === 0 && connectedInRoom === 0) {
-      rooms.delete(roomId);
-      removed.push(roomId);
+function broadcastRoomState(room: TableRoom) {
+  const allSockets = io.sockets.adapter.rooms.get(room.id);
+  if (!allSockets) return;
+  const seatNames = getSeatNames(room);
+  const botSeatsList = Array.from(room.botSeats || []);
+  for (const sid of allSockets) {
+    let viewerSeat: Seat | null = null;
+    for (const s of ALL_SEATS) {
+      if (room.seats[s]?.socketId === sid) {
+        viewerSeat = s;
+        break;
+      }
     }
+    io.to(sid).emit('table_state', {
+      tableId: room.id,
+      mySeat: viewerSeat,
+      playerName: viewerSeat ? room.seats[viewerSeat]?.playerName : undefined,
+      seatNames,
+      botSeats: botSeatsList,
+      chatMessages: room.chatMessages,
+      game: sanitizeStateForSeat(room.game, viewerSeat),
+    });
   }
-  return removed;
 }
 
 function buildRoomsList() {
@@ -122,7 +135,10 @@ function buildRoomsList() {
     const seats: Partial<Record<Seat, string>> = {};
     let occupiedCount = 0;
     for (const s of ALL_SEATS) {
-      if (room.seats[s]?.playerName) {
+      if (room.botSeats?.has(s)) {
+        seats[s] = room.seats[s]?.playerName || `Bot ${SEAT_FULL_NAME[s]}`;
+        occupiedCount += 1;
+      } else if (room.seats[s]?.playerName) {
         seats[s] = room.seats[s]!.playerName;
         occupiedCount += 1;
       }
@@ -134,6 +150,7 @@ function buildRoomsList() {
       phase: room.game.phase,
       occupiedCount,
       seats,
+      botSeats: Array.from(room.botSeats || []),
     };
   });
 }
@@ -219,6 +236,126 @@ async function persistCompletedBoard(tableId: string, game: GameState) {
   }
 }
 
+function syncRoomSeatNamesFromSessions(room: TableRoom) {
+  for (const s of ALL_SEATS) {
+    if (room.botSeats.has(s)) {
+      room.seatNames[s] = room.seats[s]?.playerName || `Bot ${SEAT_FULL_NAME[s]}`;
+    } else if (room.seats[s]?.playerName) {
+      room.seatNames[s] = room.seats[s]!.playerName;
+    } else {
+      delete room.seatNames[s];
+    }
+  }
+}
+
+function getOrCreateRoom(tableId: string, password?: string): TableRoom {
+  let room = rooms.get(tableId);
+  if (!room) {
+    const cleanPw =
+      typeof password === 'string' && password.trim().length > 0
+        ? password.trim()
+        : undefined;
+    const created: TableRoom = {
+      id: tableId,
+      password: cleanPw,
+      seats: {},
+      game: createNewBoard(1),
+      botSeats: new Set<Seat>(),
+      botTimer: null,
+      chatMessages: [],
+      seatNames: {},
+      applyBid: (targetRoom, seat, call) => {
+        const r = targetRoom as TableRoom;
+        const res = applyBid(r.game, seat, call);
+        if (res.ok && r.game.phase === 'FINISHED') {
+          void persistCompletedBoard(r.id, r.game);
+        }
+        return res;
+      },
+      applyPlayCard: (targetRoom, seat, card) => {
+        const r = targetRoom as TableRoom;
+        const res = applyPlayCard(r.game, seat, card);
+        if (res.ok && r.game.phase === 'FINISHED') {
+          void persistCompletedBoard(r.id, r.game);
+        }
+        return res;
+      },
+      applyRespondClaim: (targetRoom, seat, accept) => {
+        const r = targetRoom as TableRoom;
+        const res = respondToClaim(r.game, seat, accept);
+        if (res.ok && r.game.phase === 'FINISHED') {
+          void persistCompletedBoard(r.id, r.game);
+        }
+        return res;
+      },
+      broadcastTableState: (targetRoom) => {
+        broadcastRoomState(targetRoom as TableRoom);
+      },
+      broadcastRoomsList: () => {
+        io.emit('rooms_updated', buildRoomsList());
+      },
+    };
+    room = created;
+    rooms.set(tableId, room);
+  }
+  syncRoomSeatNamesFromSessions(room);
+  return room;
+}
+
+function getOccupiedCount(room: TableRoom): number {
+  let count = 0;
+  for (const s of ALL_SEATS) {
+    if (room.botSeats?.has(s) || room.seats[s]?.playerName) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function cleanupEmptyRooms(): string[] {
+  const removed: string[] = [];
+  for (const [roomId, room] of Array.from(rooms.entries())) {
+    const connectedInRoom = io.sockets.adapter.rooms.get(roomId)?.size ?? 0;
+    if (getOccupiedCount(room) === 0 && connectedInRoom === 0) {
+      clearBotTimer(room);
+      rooms.delete(roomId);
+      removed.push(roomId);
+    }
+  }
+  return removed;
+}
+
+function removeSeatFromRoom(room: TableRoom, seat: Seat) {
+  if (room.botSeats.has(seat)) {
+    removeBotSeat(room, seat);
+    delete room.seats[seat];
+    syncRoomSeatNamesFromSessions(room);
+    broadcastRoomState(room);
+    io.emit('rooms_updated', buildRoomsList());
+    scheduleBotTurn(room);
+    return;
+  }
+
+  const session = room.seats[seat];
+  if (!session) return;
+
+  const targetSocket = io.sockets.sockets.get(session.socketId);
+  if (targetSocket) {
+    targetSocket.leave(room.id);
+    targetSocket.emit('removed_from_room', {
+      tableId: room.id,
+      seat,
+      reason: 'You were removed from the table.',
+    });
+    targetSocket.emit('left_table');
+  }
+
+  delete room.seats[seat];
+  syncRoomSeatNamesFromSessions(room);
+  broadcastRoomState(room);
+  io.emit('rooms_updated', buildRoomsList());
+}
+
 app.get('/health', (_req, res) => {
   res.json({ ok: true });
 });
@@ -250,60 +387,26 @@ app.get('/api/boards/:tableId', async (req, res) => {
   return res.json({ boards: memoryBoards.get(tableId) || [] });
 });
 
-function getSeatNames(room: TableRoom): Partial<Record<Seat, string>> {
-  const names: Partial<Record<Seat, string>> = {};
-  for (const s of ALL_SEATS) {
-    if (room.seats[s]?.playerName) {
-      names[s] = room.seats[s]!.playerName;
-    }
-  }
-  return names;
-}
-
-function broadcastRoomState(room: TableRoom) {
-  const allSockets = io.sockets.adapter.rooms.get(room.id);
-  if (!allSockets) return;
-  const seatNames = getSeatNames(room);
-  for (const sid of allSockets) {
-    let viewerSeat: Seat | null = null;
-    for (const s of ALL_SEATS) {
-      if (room.seats[s]?.socketId === sid) {
-        viewerSeat = s;
-        break;
-      }
-    }
-    io.to(sid).emit('table_state', {
-      tableId: room.id,
-      mySeat: viewerSeat,
-      playerName: viewerSeat ? room.seats[viewerSeat]?.playerName : undefined,
-      seatNames,
-      chatMessages: room.chatMessages,
-      game: sanitizeStateForSeat(room.game, viewerSeat),
-    });
-  }
-}
-
-function removeSeatFromRoom(room: TableRoom, seat: Seat) {
-  const session = room.seats[seat];
-  if (!session) return;
-
-  const targetSocket = io.sockets.sockets.get(session.socketId);
-  if (targetSocket) {
-    targetSocket.leave(room.id);
-    targetSocket.emit('removed_from_room', {
-      tableId: room.id,
-      seat,
-      reason: 'You were removed from the table.',
-    });
-    targetSocket.emit('left_table');
-  }
-
-  delete room.seats[seat];
-  broadcastRoomState(room);
-  io.emit('rooms_updated', buildRoomsList());
-}
-
 io.on('connection', (socket) => {
+  registerBotSocketHandlers(
+    io,
+    socket,
+    (tableId) => rooms.get(tableId),
+    (mutatedRoom) => {
+      const r = mutatedRoom as TableRoom;
+      for (const s of ALL_SEATS) {
+        if (r.botSeats.has(s) && !r.seats[s]) {
+          r.seats[s] = {
+            socketId: `bot-${s}`,
+            token: `bot-${s}`,
+            playerName: r.seatNames[s] || `Bot ${SEAT_FULL_NAME[s]}`,
+          };
+        }
+      }
+      syncRoomSeatNamesFromSessions(r);
+    }
+  );
+
   socket.on(
     'join_table',
     ({
@@ -312,12 +415,14 @@ io.on('connection', (socket) => {
       playerName,
       password,
       reconnectToken,
+      fillBots,
     }: {
       tableId: string;
       seat: Seat;
       playerName?: string;
       password?: string;
       reconnectToken?: string;
+      fillBots?: boolean;
     }) => {
       const cleanTableId = (tableId || 'main-room').trim() || 'main-room';
       const existingRoom = rooms.get(cleanTableId);
@@ -334,7 +439,7 @@ io.on('connection', (socket) => {
         }
       }
 
-      if (existing && existing.socketId !== socket.id) {
+      if (existing && !existingRoom?.botSeats.has(seat) && existing.socketId !== socket.id) {
         const oldSocketActive = io.sockets.sockets.has(existing.socketId);
         if (oldSocketActive && existing.token !== reconnectToken) {
           socket.emit('error_msg', `Seat ${seat} is already occupied in room ${cleanTableId}.`);
@@ -352,6 +457,7 @@ io.on('connection', (socket) => {
                 delete prevRoom.seats[s];
               }
             }
+            syncRoomSeatNamesFromSessions(prevRoom);
             broadcastRoomState(prevRoom);
           }
         }
@@ -359,6 +465,10 @@ io.on('connection', (socket) => {
 
       const room = getOrCreateRoom(cleanTableId, password);
       socket.join(cleanTableId);
+
+      if (room.botSeats.has(seat)) {
+        room.botSeats.delete(seat);
+      }
 
       const token = reconnectToken || uuidv4();
       const trimmedName =
@@ -368,17 +478,37 @@ io.on('connection', (socket) => {
 
       room.seats[seat] = { socketId: socket.id, token, playerName: trimmedName };
 
+      if (fillBots) {
+        const openSeats = ALL_SEATS.filter(
+          (s) => s !== seat && !room.seats[s]?.playerName && !room.botSeats.has(s)
+        );
+        fillOpenSeatsWithBots(room, openSeats);
+        for (const s of openSeats) {
+          if (room.botSeats.has(s) && !room.seats[s]) {
+            room.seats[s] = {
+              socketId: `bot-${s}`,
+              token: `bot-${s}`,
+              playerName: room.seatNames[s] || `Bot ${SEAT_FULL_NAME[s]}`,
+            };
+          }
+        }
+      }
+
+      syncRoomSeatNamesFromSessions(room);
+
       socket.emit('table_state', {
         tableId: cleanTableId,
         mySeat: seat,
         playerName: trimmedName,
         seatNames: getSeatNames(room),
+        botSeats: Array.from(room.botSeats),
         chatMessages: room.chatMessages,
         reconnectToken: token,
         game: sanitizeStateForSeat(room.game, seat),
       });
       broadcastRoomState(room);
       io.emit('rooms_updated', buildRoomsList());
+      scheduleBotTurn(room);
     }
   );
 
@@ -415,6 +545,7 @@ io.on('connection', (socket) => {
       await persistCompletedBoard(tableId, room.game);
     }
     broadcastRoomState(room);
+    scheduleBotTurn(room);
   });
 
   socket.on(
@@ -487,24 +618,49 @@ io.on('connection', (socket) => {
     }
   );
 
-  socket.on('play_card', async ({ tableId, card }: { tableId: string; card: Card }) => {
-    const room = rooms.get(tableId);
-    if (!room) return;
-    const seat = ALL_SEATS.find((s) => room.seats[s]?.socketId === socket.id);
-    if (!seat) {
-      socket.emit('error_msg', 'Sit at a seat before playing cards.');
-      return;
+  socket.on(
+    'play_card',
+    async ({
+      tableId,
+      card,
+      seat: requestedSeat,
+    }: {
+      tableId: string;
+      card: Card;
+      seat?: Seat;
+    }) => {
+      const room = rooms.get(tableId);
+      if (!room) return;
+      const seatedPlayer = ALL_SEATS.find((s) => room.seats[s]?.socketId === socket.id);
+      if (!seatedPlayer) {
+        socket.emit('error_msg', 'Sit at a seat before playing cards.');
+        return;
+      }
+
+      const isDeclarerPlayingDummy =
+        room.game.phase === 'PLAYING' &&
+        room.game.currentTurn === room.game.dummy &&
+        room.game.contract?.declarer === seatedPlayer &&
+        (!requestedSeat || requestedSeat === room.game.dummy);
+
+      const actingSeat: Seat = isDeclarerPlayingDummy
+        ? room.game.currentTurn
+        : requestedSeat && requestedSeat === seatedPlayer
+        ? requestedSeat
+        : seatedPlayer;
+
+      const result = applyPlayCard(room.game, actingSeat, card);
+      if (!result.ok) {
+        socket.emit('error_msg', result.error || 'Illegal play.');
+        return;
+      }
+      if (room.game.phase === 'FINISHED') {
+        await persistCompletedBoard(tableId, room.game);
+      }
+      broadcastRoomState(room);
+      scheduleBotTurn(room);
     }
-    const result = applyPlayCard(room.game, seat, card);
-    if (!result.ok) {
-      socket.emit('error_msg', result.error || 'Illegal play.');
-      return;
-    }
-    if (room.game.phase === 'FINISHED') {
-      await persistCompletedBoard(tableId, room.game);
-    }
-    broadcastRoomState(room);
-  });
+  );
 
   socket.on(
     'claim_tricks',
@@ -522,6 +678,7 @@ io.on('connection', (socket) => {
         return;
       }
       broadcastRoomState(room);
+      scheduleBotTurn(room);
     }
   );
 
@@ -542,6 +699,7 @@ io.on('connection', (socket) => {
       await persistCompletedBoard(tableId, room.game);
     }
     broadcastRoomState(room);
+    scheduleBotTurn(room);
   });
 
   socket.on('send_chat', ({ tableId, text }: { tableId: string; text: string }) => {
@@ -579,6 +737,7 @@ io.on('connection', (socket) => {
     if (!room) return;
     room.game = createNewBoard(room.game.boardNumber + 1);
     broadcastRoomState(room);
+    scheduleBotTurn(room);
   });
 
   socket.on('leave_table', ({ tableId }: { tableId?: string }) => {
@@ -601,6 +760,7 @@ io.on('connection', (socket) => {
             delete room.seats[s];
           }
         }
+        syncRoomSeatNamesFromSessions(room);
         broadcastRoomState(room);
       }
     }

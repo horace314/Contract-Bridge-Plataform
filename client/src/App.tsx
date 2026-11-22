@@ -659,6 +659,8 @@ export default function App() {
   const [newRoomPassword, setNewRoomPassword] = useState('');
   const [showNewRoomPassword, setShowNewRoomPassword] = useState(false);
   const [newRoomSeat, setNewRoomSeat] = useState<Seat>('S');
+  const [fillOpenSeatsWithBots, setFillOpenSeatsWithBots] = useState(false);
+  const [botSeats, setBotSeats] = useState<Seat[]>([]);
   const [availableRooms, setAvailableRooms] = useState<RoomSummary[]>([]);
   const [viewportWidth, setViewportWidth] = useState<number>(() =>
     typeof window !== 'undefined' ? window.innerWidth : 1200
@@ -952,6 +954,9 @@ export default function App() {
       if (payload.seatNames) {
         setSeatNames(payload.seatNames);
       }
+      if (Array.isArray(payload.botSeats)) {
+        setBotSeats(payload.botSeats.filter((s: unknown): s is Seat => SEATS.includes(s as Seat)));
+      }
       if (Array.isArray(payload.chatMessages)) {
         setChatMessages(payload.chatMessages);
       }
@@ -1023,6 +1028,7 @@ export default function App() {
       setGame(null);
       setMySeat(null);
       setSeatNames({});
+      setBotSeats([]);
       setDisplayedTrick([]);
       setSelectedBidLevel(null);
       setExplainingBidIndex(null);
@@ -1175,7 +1181,12 @@ export default function App() {
     }
   }, [game?.phase, game?.score, game?.boardNumber, tableId, lastScoredBoardId]);
 
-  const joinSeat = (seat: Seat, targetRoomId?: string, passwordOverride?: string) => {
+  const joinSeat = (
+    seat: Seat,
+    targetRoomId?: string,
+    passwordOverride?: string,
+    fillBotsOverride?: boolean
+  ) => {
     if (!socket) return;
     const chosenRoom = (targetRoomId ?? tableId).trim();
     if (!chosenRoom) return;
@@ -1188,14 +1199,57 @@ export default function App() {
     const reconnectToken = localStorage.getItem(tokenKey) || undefined;
     const effectivePassword =
       passwordOverride !== undefined ? passwordOverride.trim() : roomPasswordInput.trim();
+    const shouldFillBots =
+      fillBotsOverride !== undefined ? fillBotsOverride : fillOpenSeatsWithBots;
     socket.emit('join_table', {
       tableId: chosenRoom,
       seat,
       playerName: trimmedName,
       password: effectivePassword || undefined,
       reconnectToken,
+      fillBots: shouldFillBots || undefined,
     });
     setDrawerOpen(false);
+    setTimeout(() => loadRooms(), 150);
+  };
+
+  const addBotToSeat = (seat: Seat) => {
+    const activeRoom = tableId.trim();
+    if (!activeRoom || seatNames[seat] || botSeats.includes(seat)) return;
+    const botLabel = `Bot ${SEAT_FULL_NAME[seat]}`;
+    if (socket?.connected) {
+      socket.emit('add_bot', {
+        tableId: activeRoom,
+        seat,
+        botName: botLabel,
+      });
+    } else {
+      setBotSeats((prev) => (prev.includes(seat) ? prev : [...prev, seat]));
+      setSeatNames((prev) => ({ ...prev, [seat]: botLabel }));
+    }
+    setTimeout(() => loadRooms(), 150);
+  };
+
+  const fillRemainingSeatsWithBots = () => {
+    const activeRoom = tableId.trim();
+    if (!activeRoom) return;
+    const openSeats = SEATS.filter((s) => !seatNames[s] && !botSeats.includes(s));
+    if (openSeats.length === 0) return;
+    if (socket?.connected) {
+      socket.emit('fill_bots', {
+        tableId: activeRoom,
+        seats: openSeats,
+      });
+    } else {
+      setBotSeats((prev) => Array.from(new Set([...prev, ...openSeats])));
+      setSeatNames((prev) => {
+        const next = { ...prev };
+        openSeats.forEach((s) => {
+          if (!next[s]) next[s] = `Bot ${SEAT_FULL_NAME[s]}`;
+        });
+        return next;
+      });
+    }
     setTimeout(() => loadRooms(), 150);
   };
 
@@ -1234,6 +1288,7 @@ export default function App() {
     } catch {
       // Ignore storage errors
     }
+    setBotSeats((prev) => prev.filter((s) => s !== seat));
     setSeatNames((prev) => {
       const next = { ...prev };
       delete next[seat];
@@ -1296,8 +1351,9 @@ export default function App() {
     setExplanationInput('');
   };
 
-  const sendCard = (card: Card) => {
-    socket?.emit('play_card', { tableId, card });
+  const sendCard = (card: Card, actingSeat?: Seat) => {
+    const resolvedSeat = actingSeat || activeHandSeat || mySeat || undefined;
+    socket?.emit('play_card', { tableId, card, seat: resolvedSeat });
   };
 
   const submitClaim = () => {
@@ -2726,6 +2782,27 @@ export default function App() {
                         {showNewRoomPassword ? 'Hide' : 'Show'}
                       </button>
                     </div>
+
+                    <label
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 8,
+                        fontSize: 12.5,
+                        fontWeight: 600,
+                        color: '#1e293b',
+                        cursor: 'pointer',
+                        userSelect: 'none',
+                      }}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={fillOpenSeatsWithBots}
+                        onChange={(e) => setFillOpenSeatsWithBots(e.target.checked)}
+                        style={{ width: 15, height: 15, cursor: 'pointer' }}
+                      />
+                      <span>Fill other open seats with AI bots</span>
+                    </label>
                   </div>
 
                   <button
@@ -2749,7 +2826,7 @@ export default function App() {
                       setTableId(createdId);
                       setSelectedSeat(newRoomSeat);
                       setRoomPasswordInput(newRoomPassword);
-                      joinSeat(newRoomSeat, createdId, newRoomPassword);
+                      joinSeat(newRoomSeat, createdId, newRoomPassword, fillOpenSeatsWithBots);
                     }}
                   >
                     Create &amp; Sit
@@ -2768,7 +2845,7 @@ export default function App() {
                     Boolean(game.phase === 'PLAYING' && isMyTurn && activeHandSeat === topSeat) &&
                     c.rank > 0
                   }
-                  onPlayCard={sendCard}
+                  onPlayCard={(c) => sendCard(c, topSeat)}
                   mode={dummyModeForSeat(topSeat)}
                   suitOrder={contractSuitOrder}
                 />
@@ -2829,7 +2906,7 @@ export default function App() {
                       Boolean(game.phase === 'PLAYING' && isMyTurn && activeHandSeat === leftSeat) &&
                       c.rank > 0
                     }
-                    onPlayCard={sendCard}
+                    onPlayCard={(c) => sendCard(c, leftSeat)}
                     mode={dummyModeForSeat(leftSeat)}
                     suitOrder={contractSuitOrder}
                   />
@@ -3101,7 +3178,7 @@ export default function App() {
                       Boolean(game.phase === 'PLAYING' && isMyTurn && activeHandSeat === rightSeat) &&
                       c.rank > 0
                     }
-                    onPlayCard={sendCard}
+                    onPlayCard={(c) => sendCard(c, rightSeat)}
                     mode={dummyModeForSeat(rightSeat)}
                     suitOrder={contractSuitOrder}
                   />
@@ -3169,7 +3246,7 @@ export default function App() {
                         c.rank === 0 ||
                         !(game.phase === 'PLAYING' && isMyTurn && activeHandSeat === bottomSeat)
                       }
-                      onClick={() => sendCard(c)}
+                      onClick={() => sendCard(c, bottomSeat)}
                       highlighted={game.currentTurn === bottomSeat}
                       rankFontSize={isWideScreen ? `${wideRankFontRem}rem` : undefined}
                       pipFontSize={isWideScreen ? `${widePipFontRem}rem` : undefined}
@@ -3722,11 +3799,39 @@ export default function App() {
                       border: '1px solid rgba(255, 255, 255, 0.14)',
                     }}
                   >
-                    <div style={{ fontSize: 12, fontWeight: 600 }}>
-                      Table Seats ({tableId})
+                    <div
+                      style={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        gap: 8,
+                        fontSize: 12,
+                        fontWeight: 600,
+                      }}
+                    >
+                      <span>Table Seats ({tableId})</span>
+                      {SEATS.some((s) => !seatNames[s] && !botSeats.includes(s)) && (
+                        <button
+                          type="button"
+                          onClick={fillRemainingSeatsWithBots}
+                          style={{
+                            padding: '2px 8px',
+                            borderRadius: 5,
+                            border: '1px solid rgba(250, 204, 21, 0.55)',
+                            background: 'rgba(250, 204, 21, 0.18)',
+                            color: '#fef08a',
+                            fontSize: 11,
+                            fontWeight: 600,
+                            cursor: 'pointer',
+                          }}
+                        >
+                          Fill Open with Bots
+                        </button>
+                      )}
                     </div>
                     {SEATS.map((s) => {
-                      const occupant = seatNames[s];
+                      const isBotSeat = botSeats.includes(s);
+                      const occupant = seatNames[s] || (isBotSeat ? `Bot ${SEAT_FULL_NAME[s]}` : undefined);
                       const isSelfSeat = mySeat === s;
                       return (
                         <div
@@ -3747,13 +3852,29 @@ export default function App() {
                             {occupant ? (
                               <>
                                 <span>{occupant}</span>
+                                {isBotSeat && (
+                                  <span
+                                    style={{
+                                      marginLeft: 5,
+                                      padding: '1px 5px',
+                                      borderRadius: 4,
+                                      fontSize: 10,
+                                      fontWeight: 700,
+                                      background: 'rgba(56, 189, 248, 0.22)',
+                                      color: '#bae6fd',
+                                      border: '1px solid rgba(56, 189, 248, 0.45)',
+                                    }}
+                                  >
+                                    BOT
+                                  </span>
+                                )}
                                 {isSelfSeat ? ' (You)' : ''}
                               </>
                             ) : (
                               <span style={{ opacity: 0.65 }}>Open</span>
                             )}
                           </span>
-                          {occupant && (
+                          {occupant ? (
                             <button
                               type="button"
                               onClick={() => removeSeatOccupant(s)}
@@ -3768,7 +3889,24 @@ export default function App() {
                                 cursor: 'pointer',
                               }}
                             >
-                              {isSelfSeat ? 'Leave Seat' : 'Remove'}
+                              {isSelfSeat ? 'Leave Seat' : isBotSeat ? 'Remove Bot' : 'Remove'}
+                            </button>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => addBotToSeat(s)}
+                              style={{
+                                padding: '3px 8px',
+                                borderRadius: 5,
+                                border: '1px solid rgba(250, 204, 21, 0.55)',
+                                background: 'rgba(250, 204, 21, 0.16)',
+                                color: '#fef08a',
+                                fontSize: 11,
+                                fontWeight: 600,
+                                cursor: 'pointer',
+                              }}
+                            >
+                              + Add Bot
                             </button>
                           )}
                         </div>

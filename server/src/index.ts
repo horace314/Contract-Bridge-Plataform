@@ -26,6 +26,11 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: { origin: '*' },
+});
+
 const pool = process.env.DATABASE_URL
   ? new Pool({ connectionString: process.env.DATABASE_URL })
   : null;
@@ -69,11 +74,15 @@ interface TableRoom {
 
 const rooms = new Map<string, TableRoom>();
 const memoryBoards = new Map<string, any[]>();
+const ALL_SEATS: Seat[] = ['N', 'E', 'S', 'W'];
 
 function getOrCreateRoom(tableId: string, password?: string): TableRoom {
   let room = rooms.get(tableId);
   if (!room) {
-    const cleanPw = typeof password === 'string' && password.trim().length > 0 ? password.trim() : undefined;
+    const cleanPw =
+      typeof password === 'string' && password.trim().length > 0
+        ? password.trim()
+        : undefined;
     room = {
       id: tableId,
       password: cleanPw,
@@ -88,7 +97,7 @@ function getOrCreateRoom(tableId: string, password?: string): TableRoom {
 
 function getOccupiedCount(room: TableRoom): number {
   let count = 0;
-  for (const s of ['N', 'E', 'S', 'W'] as Seat[]) {
+  for (const s of ALL_SEATS) {
     if (room.seats[s]?.playerName) {
       count += 1;
     }
@@ -112,7 +121,7 @@ function buildRoomsList() {
   return Array.from(rooms.entries()).map(([id, room]) => {
     const seats: Partial<Record<Seat, string>> = {};
     let occupiedCount = 0;
-    for (const s of ['N', 'E', 'S', 'W'] as Seat[]) {
+    for (const s of ALL_SEATS) {
       if (room.seats[s]?.playerName) {
         seats[s] = room.seats[s]!.playerName;
         occupiedCount += 1;
@@ -241,14 +250,9 @@ app.get('/api/boards/:tableId', async (req, res) => {
   return res.json({ boards: memoryBoards.get(tableId) || [] });
 });
 
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: '*' },
-});
-
 function getSeatNames(room: TableRoom): Partial<Record<Seat, string>> {
   const names: Partial<Record<Seat, string>> = {};
-  for (const s of ['N', 'E', 'S', 'W'] as Seat[]) {
+  for (const s of ALL_SEATS) {
     if (room.seats[s]?.playerName) {
       names[s] = room.seats[s]!.playerName;
     }
@@ -262,7 +266,7 @@ function broadcastRoomState(room: TableRoom) {
   const seatNames = getSeatNames(room);
   for (const sid of allSockets) {
     let viewerSeat: Seat | null = null;
-    for (const s of ['N', 'E', 'S', 'W'] as Seat[]) {
+    for (const s of ALL_SEATS) {
       if (room.seats[s]?.socketId === sid) {
         viewerSeat = s;
         break;
@@ -277,6 +281,26 @@ function broadcastRoomState(room: TableRoom) {
       game: sanitizeStateForSeat(room.game, viewerSeat),
     });
   }
+}
+
+function removeSeatFromRoom(room: TableRoom, seat: Seat) {
+  const session = room.seats[seat];
+  if (!session) return;
+
+  const targetSocket = io.sockets.sockets.get(session.socketId);
+  if (targetSocket) {
+    targetSocket.leave(room.id);
+    targetSocket.emit('removed_from_room', {
+      tableId: room.id,
+      seat,
+      reason: 'You were removed from the table.',
+    });
+    targetSocket.emit('left_table');
+  }
+
+  delete room.seats[seat];
+  broadcastRoomState(room);
+  io.emit('rooms_updated', buildRoomsList());
 }
 
 io.on('connection', (socket) => {
@@ -323,7 +347,7 @@ io.on('connection', (socket) => {
           socket.leave(joinedRoom);
           const prevRoom = rooms.get(joinedRoom);
           if (prevRoom) {
-            for (const s of ['N', 'E', 'S', 'W'] as Seat[]) {
+            for (const s of ALL_SEATS) {
               if (prevRoom.seats[s]?.socketId === socket.id) {
                 delete prevRoom.seats[s];
               }
@@ -358,10 +382,26 @@ io.on('connection', (socket) => {
     }
   );
 
+  socket.on('kick_seat', ({ tableId, seat }: { tableId: string; seat: Seat }) => {
+    const cleanTableId = (tableId || '').trim();
+    if (!cleanTableId || !ALL_SEATS.includes(seat)) return;
+    const room = rooms.get(cleanTableId);
+    if (!room) return;
+    removeSeatFromRoom(room, seat);
+  });
+
+  socket.on('vacate_seat', ({ tableId, seat }: { tableId: string; seat: Seat }) => {
+    const cleanTableId = (tableId || '').trim();
+    if (!cleanTableId || !ALL_SEATS.includes(seat)) return;
+    const room = rooms.get(cleanTableId);
+    if (!room) return;
+    removeSeatFromRoom(room, seat);
+  });
+
   socket.on('make_bid', async ({ tableId, call }: { tableId: string; call: BidCall }) => {
     const room = rooms.get(tableId);
     if (!room) return;
-    const seat = (['N', 'E', 'S', 'W'] as Seat[]).find((s) => room.seats[s]?.socketId === socket.id);
+    const seat = ALL_SEATS.find((s) => room.seats[s]?.socketId === socket.id);
     if (!seat) {
       socket.emit('error_msg', 'Sit at a seat before bidding.');
       return;
@@ -379,10 +419,18 @@ io.on('connection', (socket) => {
 
   socket.on(
     'alert_bid',
-    ({ tableId, bidIndex, explanation }: { tableId: string; bidIndex: number; explanation?: string }) => {
+    ({
+      tableId,
+      bidIndex,
+      explanation,
+    }: {
+      tableId: string;
+      bidIndex: number;
+      explanation?: string;
+    }) => {
       const room = rooms.get(tableId);
       if (!room) return;
-      const seat = (['N', 'E', 'S', 'W'] as Seat[]).find((s) => room.seats[s]?.socketId === socket.id);
+      const seat = ALL_SEATS.find((s) => room.seats[s]?.socketId === socket.id);
       if (!seat) {
         socket.emit('error_msg', 'Sit at a seat before alerting.');
         return;
@@ -399,7 +447,7 @@ io.on('connection', (socket) => {
   socket.on('request_explanation', ({ tableId, bidIndex }: { tableId: string; bidIndex: number }) => {
     const room = rooms.get(tableId);
     if (!room) return;
-    const seat = (['N', 'E', 'S', 'W'] as Seat[]).find((s) => room.seats[s]?.socketId === socket.id);
+    const seat = ALL_SEATS.find((s) => room.seats[s]?.socketId === socket.id);
     if (!seat) {
       socket.emit('error_msg', 'Sit at a seat before asking for an explanation.');
       return;
@@ -414,10 +462,18 @@ io.on('connection', (socket) => {
 
   socket.on(
     'explain_bid',
-    ({ tableId, bidIndex, explanation }: { tableId: string; bidIndex: number; explanation: string }) => {
+    ({
+      tableId,
+      bidIndex,
+      explanation,
+    }: {
+      tableId: string;
+      bidIndex: number;
+      explanation: string;
+    }) => {
       const room = rooms.get(tableId);
       if (!room) return;
-      const seat = (['N', 'E', 'S', 'W'] as Seat[]).find((s) => room.seats[s]?.socketId === socket.id);
+      const seat = ALL_SEATS.find((s) => room.seats[s]?.socketId === socket.id);
       if (!seat) {
         socket.emit('error_msg', 'Sit at a seat before explaining a bid.');
         return;
@@ -434,7 +490,7 @@ io.on('connection', (socket) => {
   socket.on('play_card', async ({ tableId, card }: { tableId: string; card: Card }) => {
     const room = rooms.get(tableId);
     if (!room) return;
-    const seat = (['N', 'E', 'S', 'W'] as Seat[]).find((s) => room.seats[s]?.socketId === socket.id);
+    const seat = ALL_SEATS.find((s) => room.seats[s]?.socketId === socket.id);
     if (!seat) {
       socket.emit('error_msg', 'Sit at a seat before playing cards.');
       return;
@@ -450,26 +506,29 @@ io.on('connection', (socket) => {
     broadcastRoomState(room);
   });
 
-  socket.on('claim_tricks', ({ tableId, claimedTricks }: { tableId: string; claimedTricks: number }) => {
-    const room = rooms.get(tableId);
-    if (!room) return;
-    const seat = (['N', 'E', 'S', 'W'] as Seat[]).find((s) => room.seats[s]?.socketId === socket.id);
-    if (!seat) {
-      socket.emit('error_msg', 'Sit at a seat before claiming.');
-      return;
+  socket.on(
+    'claim_tricks',
+    ({ tableId, claimedTricks }: { tableId: string; claimedTricks: number }) => {
+      const room = rooms.get(tableId);
+      if (!room) return;
+      const seat = ALL_SEATS.find((s) => room.seats[s]?.socketId === socket.id);
+      if (!seat) {
+        socket.emit('error_msg', 'Sit at a seat before claiming.');
+        return;
+      }
+      const result = initiateClaim(room.game, seat, claimedTricks);
+      if (!result.ok) {
+        socket.emit('error_msg', result.error || 'Invalid claim.');
+        return;
+      }
+      broadcastRoomState(room);
     }
-    const result = initiateClaim(room.game, seat, claimedTricks);
-    if (!result.ok) {
-      socket.emit('error_msg', result.error || 'Invalid claim.');
-      return;
-    }
-    broadcastRoomState(room);
-  });
+  );
 
   socket.on('respond_claim', async ({ tableId, accept }: { tableId: string; accept: boolean }) => {
     const room = rooms.get(tableId);
     if (!room) return;
-    const seat = (['N', 'E', 'S', 'W'] as Seat[]).find((s) => room.seats[s]?.socketId === socket.id);
+    const seat = ALL_SEATS.find((s) => room.seats[s]?.socketId === socket.id);
     if (!seat) {
       socket.emit('error_msg', 'Sit at a seat before responding to a claim.');
       return;
@@ -493,7 +552,7 @@ io.on('connection', (socket) => {
     if (!trimmed) return;
     const clipped = trimmed.slice(0, 400);
 
-    const seat = (['N', 'E', 'S', 'W'] as Seat[]).find((s) => room.seats[s]?.socketId === socket.id);
+    const seat = ALL_SEATS.find((s) => room.seats[s]?.socketId === socket.id);
     if (!seat) {
       socket.emit('error_msg', 'Sit at a seat to send chat messages.');
       return;
@@ -537,7 +596,7 @@ io.on('connection', (socket) => {
       socket.leave(roomId);
       const room = rooms.get(roomId);
       if (room) {
-        for (const s of ['N', 'E', 'S', 'W'] as Seat[]) {
+        for (const s of ALL_SEATS) {
           if (room.seats[s]?.socketId === socket.id) {
             delete room.seats[s];
           }

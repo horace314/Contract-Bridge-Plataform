@@ -102,6 +102,16 @@ interface CompletedBoardRecord {
   pbn: string;
 }
 
+type StagingRole = 'PLAYER' | 'MODERATOR';
+type LobbyModeTab = 'TOURNAMENT' | 'CASUAL';
+
+interface TournamentModeratorState {
+  moderatorName: string | null;
+  activeRound: number;
+  registrationOpen: boolean;
+  announcement: string;
+}
+
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:3001';
 const SEATS: Seat[] = ['N', 'E', 'S', 'W'];
 const STRAIN_ORDER: Strain[] = ['C', 'D', 'H', 'S', 'NT'];
@@ -113,6 +123,9 @@ const SEAT_FULL_NAME: Record<Seat, string> = {
 };
 const SUIT_SYM: Record<Strain, string> = { C: '♣', D: '♦', H: '♥', S: '♠', NT: 'NT' };
 const RANK_SYM: Record<number, string> = { 14: 'A', 13: 'K', 12: 'Q', 11: 'J', 10: '10' };
+
+const UI_FONT_FAMILY =
+  'Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif';
 
 function rankLabel(rank: number): string {
   return RANK_SYM[rank] || String(rank);
@@ -364,21 +377,6 @@ function renderColoredBidCall(call: BidCall) {
   );
 }
 
-function getBoardBadgeSpec(boardNumber: number) {
-  const dealers: Seat[] = ['N', 'E', 'S', 'W'];
-  const vuls: ('NONE' | 'NS' | 'EW' | 'BOTH')[] = [
-    'NONE', 'NS', 'EW', 'BOTH',
-    'NS', 'EW', 'BOTH', 'NONE',
-    'EW', 'BOTH', 'NONE', 'NS',
-    'BOTH', 'NONE', 'NS', 'EW',
-  ];
-  const idx = ((boardNumber - 1) % 16 + 16) % 16;
-  return {
-    dealer: dealers[(boardNumber - 1) % 4],
-    vul: vuls[idx],
-  };
-}
-
 function FanCardBack({
   orientation,
   count,
@@ -598,9 +596,118 @@ function ReplaySuitHandBox({
   );
 }
 
+type TournamentScoringType = 'MP' | 'IMP' | 'VP';
+type TournamentFormatType = 'PAIRS' | 'TEAMS';
+type TournamentMovementType = 'MITCHELL' | 'HOWELL' | 'SWISS' | 'ROUND_ROBIN';
+type ImpComparisonMode = 'HEAD_TO_HEAD' | 'CROSS_IMP' | 'DATUM_IMP';
+type VpScaleMode = 'WBF_CONTINUOUS_20' | 'WBF_STEPPED_25';
+
+interface TournamentSetupConfig {
+  id: string;
+  name: string;
+  format: TournamentFormatType;
+  scoringType: TournamentScoringType;
+  movement: TournamentMovementType;
+  numParticipants: number;
+  boardsPerRound: number;
+  numRounds: number;
+  minutesPerBoard: number;
+  usePreDuplicatedBoards: boolean;
+  sharedDeckSeed?: string;
+  moderatorPassword?: string;
+  impComparisonMode: ImpComparisonMode;
+  vpScaleMode: VpScaleMode;
+  mpAwardRule: '2_1_0' | '1_HALF_0';
+  tieBreakPrimary: 'NET_IMP' | 'HEAD_TO_HEAD' | 'MATCH_WINS' | 'MP_PCT';
+  tieBreakSecondary: 'NET_IMP' | 'HEAD_TO_HEAD' | 'MATCH_WINS' | 'MP_PCT';
+  createdAt: number;
+}
+
+function loadSavedTournamentConfigs(): TournamentSetupConfig[] {
+  const configs: TournamentSetupConfig[] = [];
+  const seenIds = new Set<string>();
+
+  const pushIfUnique = (cfg: TournamentSetupConfig | null | undefined) => {
+    if (!cfg || !cfg.name) return;
+    const key = cfg.id || cfg.name;
+    if (seenIds.has(key)) return;
+    seenIds.add(key);
+    configs.push(cfg);
+  };
+
+  try {
+    const activeRaw = localStorage.getItem('bridge_active_tournament_cfg');
+    if (activeRaw) {
+      pushIfUnique(JSON.parse(activeRaw));
+    }
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith('bridge_tournament_cfg_')) {
+        const raw = localStorage.getItem(k);
+        if (raw) {
+          pushIfUnique(JSON.parse(raw));
+        }
+      }
+    }
+  } catch {
+    // Ignore storage read errors
+  }
+
+  return configs;
+}
+
+function getTournamentRoomCode(cfg: TournamentSetupConfig): string {
+  const slug =
+    cfg.name
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '') || 'bridge-tourney';
+  return `${slug}-${cfg.scoringType.toLowerCase()}`;
+}
+
+function getTournamentRoomCodesSet(configs: TournamentSetupConfig[]): Set<string> {
+  const codes = new Set<string>();
+  for (const cfg of configs) {
+    codes.add(getTournamentRoomCode(cfg));
+  }
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith('bridge_tournament_cfg_')) {
+        codes.add(k.slice('bridge_tournament_cfg_'.length));
+      }
+    }
+  } catch {
+    // Ignore storage read errors
+  }
+  return codes;
+}
+
+interface TournamentLobbyParticipant {
+  id: string;
+  name: string;
+  teamName: string;
+  preferredSeat: Seat | 'ANY';
+  joinedAt: number;
+  isSelf?: boolean;
+}
+
+interface TournamentStagingLobby {
+  tournamentId: string;
+  roomCode: string;
+  config: TournamentSetupConfig;
+  teams: string[];
+  requiredSeats: number;
+  participants: TournamentLobbyParticipant[];
+  launchedToTable: boolean;
+  moderatorState?: TournamentModeratorState;
+}
+
 export default function App() {
   const [socket, setSocket] = useState<Socket | null>(null);
   const [connected, setConnected] = useState(false);
+  const [lobbyTab, setLobbyTab] = useState<LobbyModeTab>('CASUAL');
   const [tableId, setTableId] = useState('');
   const tableIdRef = useRef('');
   const [roomPasswordInput, setRoomPasswordInput] = useState('');
@@ -610,6 +717,9 @@ export default function App() {
   const [showNewRoomPassword, setShowNewRoomPassword] = useState(false);
   const [newRoomSeat, setNewRoomSeat] = useState<Seat>('S');
   const [availableRooms, setAvailableRooms] = useState<RoomSummary[]>([]);
+
+  const [moderatorAuthPromptOpen, setModeratorAuthPromptOpen] = useState(false);
+  const [moderatorAuthError, setModeratorAuthError] = useState('');
 
   useEffect(() => {
     tableIdRef.current = tableId;
@@ -645,7 +755,6 @@ export default function App() {
   } | null>(null);
   const [errorMsg, setErrorMsg] = useState('');
   const [history, setHistory] = useState<CompletedBoardRecord[]>([]);
-  const [selectedBoardPreview, setSelectedBoardPreview] = useState<number>(1);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [scoreModalOpen, setScoreModalOpen] = useState(false);
   const [cumulativeScore, setCumulativeScore] = useState<{ NS: number; EW: number }>({
@@ -665,6 +774,18 @@ export default function App() {
   const [revealedCardStep, setRevealedCardStep] = useState<number>(4);
   const [showClaimSummary, setShowClaimSummary] = useState<boolean>(false);
   const [chatOpen, setChatOpen] = useState(false);
+  const [tournamentModalOpen, setTournamentModalOpen] = useState(false);
+  const [tournamentList] = useState<TournamentSetupConfig[]>(() =>
+    loadSavedTournamentConfigs()
+  );
+  const [stagingLobby, setStagingLobby] = useState<TournamentStagingLobby | null>(null);
+
+  useEffect(() => {
+    if (lobbyTab === 'TOURNAMENT') {
+      setLobbyTab('CASUAL');
+    }
+  }, [lobbyTab]);
+
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState('');
   const [unreadChatCount, setUnreadChatCount] = useState(0);
@@ -715,6 +836,15 @@ export default function App() {
         setScoreModalOpen(false);
         return;
       }
+      if (tournamentModalOpen) {
+        setTournamentModalOpen(false);
+        return;
+      }
+      if (moderatorAuthPromptOpen) {
+        setModeratorAuthPromptOpen(false);
+        setModeratorAuthError('');
+        return;
+      }
       if (chatOpen) {
         setChatOpen(false);
         return;
@@ -732,6 +862,8 @@ export default function App() {
     historyModalBoard,
     drawerOpen,
     scoreModalOpen,
+    tournamentModalOpen,
+    moderatorAuthPromptOpen,
     chatOpen,
   ]);
 
@@ -786,9 +918,6 @@ export default function App() {
         setDisplayedTrick(nextGame.tricksHistory[nextGame.tricksHistory.length - 1].cards);
       }
 
-      if (nextGame?.boardNumber) {
-        setSelectedBoardPreview(nextGame.boardNumber);
-      }
       setErrorMsg('');
     });
 
@@ -807,6 +936,33 @@ export default function App() {
         setAvailableRooms(roomsList);
       }
     });
+
+    s.on('room_updated', (updatedRoom: RoomSummary) => {
+      if (!updatedRoom || !updatedRoom.id) return;
+      setAvailableRooms((prev) =>
+        prev.map((r) => (r.id === updatedRoom.id ? { ...r, ...updatedRoom } : r))
+      );
+    });
+
+    s.on(
+      'removed_from_room',
+      (payload: { tableId?: string; seat?: Seat; reason?: string }) => {
+        const roomName = payload?.tableId || tableIdRef.current;
+        if (roomName && payload?.seat) {
+          try {
+            localStorage.removeItem(`bridge_token_${roomName}_${payload.seat}`);
+          } catch {
+            // Ignore storage errors
+          }
+        }
+        setErrorMsg(
+          payload?.reason ||
+            (roomName
+              ? `You were removed from room "${roomName}".`
+              : 'You were removed from the table.')
+        );
+      }
+    );
 
     s.on('left_table', () => {
       setGame(null);
@@ -829,6 +985,27 @@ export default function App() {
       setErrorMsg(msg);
     });
 
+    s.on('tournament_staging_update', (payload: TournamentStagingLobby) => {
+      if (!payload || !Array.isArray(payload.participants)) return;
+      const reqCount = payload.requiredSeats || 4;
+      const filled = payload.participants.length >= reqCount;
+      const isModeratorSelf =
+        Boolean(payload.moderatorState?.moderatorName) &&
+        payload.moderatorState?.moderatorName ===
+          (playerNameInput.trim() || 'Tournament Director');
+      if (filled && !isModeratorSelf) {
+        const chosenSeat: Seat =
+          payload.participants.find((p) => p.isSelf)?.preferredSeat &&
+          payload.participants.find((p) => p.isSelf)?.preferredSeat !== 'ANY'
+            ? (payload.participants.find((p) => p.isSelf)!.preferredSeat as Seat)
+            : 'S';
+        setStagingLobby(null);
+        joinSeat(chosenSeat, payload.roomCode);
+      } else {
+        setStagingLobby({ ...payload, requiredSeats: reqCount, launchedToTable: false });
+      }
+    });
+
     return () => {
       s.disconnect();
     };
@@ -843,7 +1020,10 @@ export default function App() {
 
   const claimCutoffTrickIdx = (() => {
     if (!modalAcceptedClaim) return null;
-    if (typeof modalAcceptedClaim.acceptedAtTrickNumber === 'number' && modalAcceptedClaim.acceptedAtTrickNumber > 0) {
+    if (
+      typeof modalAcceptedClaim.acceptedAtTrickNumber === 'number' &&
+      modalAcceptedClaim.acceptedAtTrickNumber > 0
+    ) {
       return Math.max(0, modalAcceptedClaim.acceptedAtTrickNumber - 1);
     }
     return null;
@@ -851,7 +1031,10 @@ export default function App() {
 
   const claimCutoffCardStep = (() => {
     if (!modalAcceptedClaim) return null;
-    if (typeof modalAcceptedClaim.acceptedAtCardIndex === 'number' && modalAcceptedClaim.acceptedAtCardIndex >= 0) {
+    if (
+      typeof modalAcceptedClaim.acceptedAtCardIndex === 'number' &&
+      modalAcceptedClaim.acceptedAtCardIndex >= 0
+    ) {
       return modalAcceptedClaim.acceptedAtCardIndex;
     }
     return null;
@@ -1002,6 +1185,43 @@ export default function App() {
     setChatOpen(false);
     setChatMessages([]);
     setUnreadChatCount(0);
+    setTimeout(() => loadRooms(), 150);
+  };
+
+  const removeSeatOccupant = (seat: Seat) => {
+    const activeRoom = tableId.trim();
+    if (!activeRoom) return;
+    if (mySeat === seat) {
+      leaveTable();
+      return;
+    }
+    try {
+      localStorage.removeItem(`bridge_token_${activeRoom}_${seat}`);
+    } catch {
+      // Ignore storage errors
+    }
+    setSeatNames((prev) => {
+      const next = { ...prev };
+      delete next[seat];
+      return next;
+    });
+    setAvailableRooms((prev) =>
+      prev.map((room) => {
+        if (room.id !== activeRoom) return room;
+        const nextSeats: Partial<Record<Seat, string>> = { ...(room.seats || {}) };
+        delete nextSeats[seat];
+        const nextOccupiedCount = SEATS.filter((s) => Boolean(nextSeats[s])).length;
+        return {
+          ...room,
+          seats: nextSeats,
+          occupiedCount: nextOccupiedCount,
+        };
+      })
+    );
+    if (socket?.connected) {
+      socket.emit('kick_seat', { tableId: activeRoom, seat });
+      socket.emit('vacate_seat', { tableId: activeRoom, seat });
+    }
     setTimeout(() => loadRooms(), 150);
   };
 
@@ -1157,7 +1377,6 @@ export default function App() {
   const leftIsFaceUp = leftCards.some((c) => c.rank > 0);
   const rightCards = game?.hands[rightSeat] || [];
   const rightIsFaceUp = rightCards.some((c) => c.rank > 0);
-  const previewSpec = getBoardBadgeSpec(selectedBoardPreview);
 
   const displayNameForSeat = (seat: Seat) => {
     if (seatNames[seat]) return seatNames[seat]!;
@@ -1396,7 +1615,12 @@ export default function App() {
 
   const effectiveMaxStepForTrick = (tIdx: number): number => {
     const trickLen = modalTricks[tIdx]?.cards.length || 0;
-    if (modalAcceptedClaim && claimCutoffTrickIdx !== null && tIdx === claimCutoffTrickIdx && claimCutoffCardStep !== null) {
+    if (
+      modalAcceptedClaim &&
+      claimCutoffTrickIdx !== null &&
+      tIdx === claimCutoffTrickIdx &&
+      claimCutoffCardStep !== null
+    ) {
       return Math.min(trickLen, claimCutoffCardStep);
     }
     return trickLen;
@@ -1441,7 +1665,12 @@ export default function App() {
     }
     const curTrick = modalTricks[selectedTrickIdx];
     const curMaxStep = effectiveMaxStepForTrick(selectedTrickIdx);
-    if (curTrick && curTrick.cards.length > 0 && revealedCardStep >= curTrick.cards.length && revealedCardStep >= curMaxStep) {
+    if (
+      curTrick &&
+      curTrick.cards.length > 0 &&
+      revealedCardStep >= curTrick.cards.length &&
+      revealedCardStep >= curMaxStep
+    ) {
       if (sideOf(curTrick.winner) === 'NS') ns += 1;
       else ew += 1;
     }
@@ -1462,310 +1691,504 @@ export default function App() {
 
   const vulClass = `vul-${(game?.vulnerability || 'NONE').toLowerCase()}`;
 
-  return (
-    <div className="felt-shell">
-      {game && (
-      <aside className="felt-left-rail">
-        <button
-          type="button"
-          className="rail-menu-btn"
-          onClick={() => {
-            setDrawerOpen((o) => {
-              if (!o) loadRooms();
-              return !o;
-            });
-          }}
-          title="Boards, Scoreboard & Room Settings"
-        >
-          ☰
-        </button>
+  const renderSeatKickButton = (seat: Seat) => {
+    if (!seatNames[seat] || mySeat === seat) return null;
+    return (
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          removeSeatOccupant(seat);
+        }}
+        title={`Remove ${displayNameForSeat(seat)} from ${SEAT_FULL_NAME[seat]} (${seat})`}
+        style={{
+          marginLeft: 5,
+          padding: '0 5px',
+          borderRadius: 4,
+          border: '1px solid rgba(248, 113, 113, 0.55)',
+          background: 'rgba(185, 28, 28, 0.78)',
+          color: '#ffffff',
+          fontSize: 10.5,
+          fontWeight: 700,
+          lineHeight: 1.35,
+          cursor: 'pointer',
+        }}
+      >
+        ✕
+      </button>
+    );
+  };
 
-        <div
-          className={`rail-board-box has-dealer-edge dealer-${(game?.dealer || 'N').toLowerCase()} hover-anchor ${vulClass}`}
-          style={{
-            padding: 12,
-            borderWidth: 14,
-            position: 'relative',
-          }}
-          onMouseEnter={() => setHoverBoardPopup(true)}
-          onMouseLeave={() => setHoverBoardPopup(false)}
-          onClick={() => {
-            setHoverBoardPopup((prev) => !prev);
-            setHoverContractPopup(false);
-            setHoverLastTrickPopup(false);
-          }}
-        >
-          <span
-            className="rail-dealer-edge-mark"
+  return (
+    <div
+      className="felt-shell"
+      style={{ fontFamily: UI_FONT_FAMILY, boxSizing: 'border-box', overflowX: 'hidden' }}
+    >
+      {game && (
+        <aside className="felt-left-rail">
+          <button
+            type="button"
+            className="rail-menu-btn"
+            onClick={() => {
+              setDrawerOpen((o) => {
+                if (!o) loadRooms();
+                return !o;
+              });
+            }}
+            title="Boards, Scoreboard & Room Settings"
+          >
+            ☰
+          </button>
+
+          <div
+            className={`rail-board-box has-dealer-edge dealer-${(game?.dealer || 'N').toLowerCase()} hover-anchor ${vulClass}`}
             style={{
-              position: 'absolute',
-              fontSize: 11,
-              fontWeight: 800,
-              lineHeight: 1,
-              pointerEvents: 'none',
-              color:
-                (game?.vulnerability === 'BOTH' ||
+              padding: 12,
+              borderWidth: 14,
+              position: 'relative',
+            }}
+            onMouseEnter={() => setHoverBoardPopup(true)}
+            onMouseLeave={() => setHoverBoardPopup(false)}
+            onClick={() => {
+              setHoverBoardPopup((prev) => !prev);
+              setHoverContractPopup(false);
+              setHoverLastTrickPopup(false);
+            }}
+          >
+            <span
+              className="rail-dealer-edge-mark"
+              style={{
+                position: 'absolute',
+                fontSize: 11,
+                fontWeight: 800,
+                lineHeight: 1,
+                pointerEvents: 'none',
+                color:
+                  game?.vulnerability === 'BOTH' ||
                   (game?.vulnerability === 'NS' &&
                     ((game?.dealer ?? 'N') === 'N' || (game?.dealer ?? 'N') === 'S')) ||
                   (game?.vulnerability === 'EW' &&
-                    ((game?.dealer ?? 'N') === 'E' || (game?.dealer ?? 'N') === 'W')))
-                  ? '#ffffff'
-                  : '#111827',
-              ...((game?.dealer ?? 'N') === 'N'
-                ? { top: -13, left: '50%', transform: 'translateX(-50%)' }
-                : (game?.dealer ?? 'N') === 'S'
-                ? { bottom: -13, left: '50%', transform: 'translateX(-50%)' }
-                : (game?.dealer ?? 'N') === 'W'
-                ? { left: -13, top: '50%', transform: 'translateY(-50%)' }
-                : { right: -13, top: '50%', transform: 'translateY(-50%)' }),
-            }}
-          >
-            D
-          </span>
-          <div className="rail-board-inner">
-            <div className="rail-board-num">{game?.boardNumber ?? 1}</div>
-          </div>
-
-          {hoverBoardPopup && (
-            <div
-              className="rail-hover-popover board-scores-popover"
-              onClick={(e) => e.stopPropagation()}
+                    ((game?.dealer ?? 'N') === 'E' || (game?.dealer ?? 'N') === 'W'))
+                    ? '#ffffff'
+                    : '#111827',
+                ...((game?.dealer ?? 'N') === 'N'
+                  ? { top: -13, left: '50%', transform: 'translateX(-50%)' }
+                  : (game?.dealer ?? 'N') === 'S'
+                  ? { bottom: -13, left: '50%', transform: 'translateX(-50%)' }
+                  : (game?.dealer ?? 'N') === 'W'
+                  ? { left: -13, top: '50%', transform: 'translateY(-50%)' }
+                  : { right: -13, top: '50%', transform: 'translateY(-50%)' }),
+              }}
             >
-              <div className="popover-title">Table &amp; Duplicate Records</div>
-              <div className="scorecard-sheet-wrap">
-                <table className="scorecard-sheet-table">
-                  <thead>
-                    <tr>
-                      <th>Board</th>
-                      <th>Result</th>
-                      <th>We</th>
-                      <th>They</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {history.length === 0 ? (
+              D
+            </span>
+            <div className="rail-board-inner">
+              <div className="rail-board-num">{game?.boardNumber ?? 1}</div>
+            </div>
+
+            {hoverBoardPopup && (
+              <div
+                className="rail-hover-popover board-scores-popover"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="popover-title">Table &amp; Duplicate Records</div>
+                <div className="scorecard-sheet-wrap">
+                  <table className="scorecard-sheet-table">
+                    <thead>
                       <tr>
-                        <td colSpan={4} className="scorecard-empty-cell">
-                          No completed boards yet.
+                        <th>Board</th>
+                        <th>Result</th>
+                        <th>We</th>
+                        <th>They</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {history.length === 0 ? (
+                        <tr>
+                          <td colSpan={4} className="scorecard-empty-cell">
+                            No completed boards yet.
+                          </td>
+                        </tr>
+                      ) : (
+                        history.map((b, idx) => {
+                          const info = formatContractAndResult(b);
+                          const isEven = idx % 2 === 1;
+                          return (
+                            <tr
+                              key={b.id}
+                              className={`scorecard-row ${isEven ? 'alt-row' : ''}`}
+                            >
+                              <td>{b.board_number}</td>
+                              <td className="scorecard-result-cell">
+                                <span>{info.compactResult}</span>
+                              </td>
+                              <td className="scorecard-pts-cell" style={{ textAlign: 'center' }}>
+                                {b.score_ns > 0 ? b.score_ns : ''}
+                              </td>
+                              <td className="scorecard-pts-cell" style={{ textAlign: 'center' }}>
+                                {b.score_ew > 0 ? b.score_ew : ''}
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                    <tfoot>
+                      <tr className="scorecard-total-row">
+                        <td colSpan={2}>Total</td>
+                        <td className="scorecard-total-yellow" style={{ textAlign: 'center' }}>
+                          {cumulativeScore.NS}
+                        </td>
+                        <td className="scorecard-total-yellow" style={{ textAlign: 'center' }}>
+                          {cumulativeScore.EW}
                         </td>
                       </tr>
-                    ) : (
-                      history.map((b, idx) => {
-                        const info = formatContractAndResult(b);
-                        const isEven = idx % 2 === 1;
-                        return (
-                          <tr
-                            key={b.id}
-                            className={`scorecard-row ${isEven ? 'alt-row' : ''}`}
-                          >
-                            <td>{b.board_number}</td>
-                            <td className="scorecard-result-cell">
-                              <span>{info.compactResult}</span>
-                            </td>
-                            <td className="scorecard-pts-cell" style={{ textAlign: 'center' }}>
-                              {b.score_ns > 0 ? b.score_ns : ''}
-                            </td>
-                            <td className="scorecard-pts-cell" style={{ textAlign: 'center' }}>
-                              {b.score_ew > 0 ? b.score_ew : ''}
-                            </td>
-                          </tr>
-                        );
-                      })
-                    )}
-                  </tbody>
-                  <tfoot>
-                    <tr className="scorecard-total-row">
-                      <td colSpan={2}>Total</td>
-                      <td className="scorecard-total-yellow" style={{ textAlign: 'center' }}>{cumulativeScore.NS}</td>
-                      <td className="scorecard-total-yellow" style={{ textAlign: 'center' }}>{cumulativeScore.EW}</td>
-                    </tr>
-                  </tfoot>
-                </table>
+                    </tfoot>
+                  </table>
+                </div>
               </div>
-            </div>
-          )}
-        </div>
+            )}
+          </div>
 
-        <div
-          className="rail-contract-box hover-anchor"
-          onMouseEnter={() => setHoverContractPopup(true)}
-          onMouseLeave={() => setHoverContractPopup(false)}
-          onClick={() => {
-            setHoverContractPopup((prev) => !prev);
-            setHoverBoardPopup(false);
-            setHoverLastTrickPopup(false);
-          }}
-        >
-          <div className="rail-contract-main">
-            {game?.contract ? (
-              <span className="bid-text-black">
-                {game.contract.level}
-                <span className={isRedStrain(game.contract.strain) ? 'suit-red' : 'suit-black'}>
-                  {SUIT_SYM[game.contract.strain]}
+          <div
+            className="rail-contract-box hover-anchor"
+            onMouseEnter={() => setHoverContractPopup(true)}
+            onMouseLeave={() => setHoverContractPopup(false)}
+            onClick={() => {
+              setHoverContractPopup((prev) => !prev);
+              setHoverBoardPopup(false);
+              setHoverLastTrickPopup(false);
+            }}
+          >
+            <div className="rail-contract-main">
+              {game?.contract ? (
+                <span className="bid-text-black">
+                  {game.contract.level}
+                  <span className={isRedStrain(game.contract.strain) ? 'suit-red' : 'suit-black'}>
+                    {SUIT_SYM[game.contract.strain]}
+                  </span>
+                  {game.contract.doubled === 1 ? 'X' : game.contract.doubled === 2 ? 'XX' : ''}
                 </span>
-                {game.contract.doubled === 1 ? 'X' : game.contract.doubled === 2 ? 'XX' : ''}
-              </span>
-            ) : (
-              '—'
-            )}
-          </div>
-          <div className="rail-contract-by">
-            {game?.contract?.declarer
-              ? game.phase === 'PLAYING'
-                ? `${game.contract.level}${
-                    game.contract.strain === 'NT' ? 'NT' : SUIT_SYM[game.contract.strain]
-                  }${
-                    game.contract.doubled === 1
-                      ? 'X'
-                      : game.contract.doubled === 2
-                      ? 'XX'
-                      : ''
-                  } - ${game.contract.declarer}`
-                : game.contract.declarer
-              : 'Auction'}
-          </div>
-
-          {hoverContractPopup && game && (
-            <div className="rail-hover-popover contract-popover">
-              <div className="popover-title">Bidding Sequence</div>
-              {game.auction.length === 0 ? (
-                <div className="popover-empty">No bids yet</div>
               ) : (
-                <div className="popover-auction-grid">
-                  {auctionCols.map((col) => (
-                    <div key={col} className="popover-col-head">
-                      {col}
-                    </div>
-                  ))}
-                  {auctionRows.map((row, rIdx) =>
-                    row.map((cell, cIdx) => (
-                      <div key={`${rIdx}-${cIdx}`} className="popover-cell">
-                        {renderAuctionCellContent(cell, 'popover')}
-                      </div>
-                    ))
-                  )}
-                </div>
+                '—'
               )}
             </div>
-          )}
-        </div>
+            <div className="rail-contract-by">
+              {game?.contract?.declarer
+                ? game.phase === 'PLAYING'
+                  ? `${game.contract.level}${
+                      game.contract.strain === 'NT' ? 'NT' : SUIT_SYM[game.contract.strain]
+                    }${
+                      game.contract.doubled === 1
+                        ? 'X'
+                        : game.contract.doubled === 2
+                        ? 'XX'
+                        : ''
+                    } - ${game.contract.declarer}`
+                  : game.contract.declarer
+                : 'Auction'}
+            </div>
 
-        <div
-          className="rail-tricks-box hover-anchor"
-          onMouseEnter={() => setHoverLastTrickPopup(true)}
-          onMouseLeave={() => setHoverLastTrickPopup(false)}
-          onClick={() => {
-            setHoverLastTrickPopup((prev) => !prev);
-            setHoverBoardPopup(false);
-            setHoverContractPopup(false);
-          }}
-        >
-          <span>{game?.tricksWon.NS ?? 0}</span>
-          <span>{game?.tricksWon.EW ?? 0}</span>
-
-          {hoverLastTrickPopup && game && (
-            <div className="rail-hover-popover trick-popover">
-              <div className="popover-title">
-                {lastTrick ? `Last Trick · Won by ${lastTrick.winner}` : 'Last Trick'}
+            {hoverContractPopup && game && (
+              <div className="rail-hover-popover contract-popover">
+                <div className="popover-title">Bidding Sequence</div>
+                {game.auction.length === 0 ? (
+                  <div className="popover-empty">No bids yet</div>
+                ) : (
+                  <div className="popover-auction-grid">
+                    {auctionCols.map((col) => (
+                      <div key={col} className="popover-col-head">
+                        {col}
+                      </div>
+                    ))}
+                    {auctionRows.map((row, rIdx) =>
+                      row.map((cell, cIdx) => (
+                        <div key={`${rIdx}-${cIdx}`} className="popover-cell">
+                          {renderAuctionCellContent(cell, 'popover')}
+                        </div>
+                      ))
+                    )}
+                  </div>
+                )}
               </div>
-              {!lastTrick ? (
-                <div className="popover-empty">No completed trick yet</div>
-              ) : (
-                <div className="trick-mini-table">
-                  {lastTrick.cards.slice(0, animatedTrickCount).map((play, idx) => {
-                    const slot = visualSlotForSeat(play.seat);
-                    return (
-                      <div
-                        key={`${play.seat}-${idx}`}
-                        className={`trick-mini-slot trick-mini-${slot} trick-anim-pop`}
-                      >
-                        <span className="trick-mini-seat">{play.seat}</span>
-                        <HoverTrickCardPicture card={play.card} />
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-
-        {game && (
-          <button
-            type="button"
-            className={`rail-chat-btn ${chatOpen ? 'active' : ''}`}
-            onClick={() => setChatOpen((prev) => !prev)}
-            title="Table Chat (visible to all 4 players)"
-          >
-            <span>Chat</span>
-            {unreadChatCount > 0 && (
-              <span className="rail-chat-badge">
-                {unreadChatCount > 99 ? '99+' : unreadChatCount}
-              </span>
             )}
-          </button>
-        )}
+          </div>
 
-        {canDeclarerClaim ? (
-          <button
-            type="button"
-            className="rail-claim-btn"
+          <div
+            className="rail-tricks-box hover-anchor"
+            onMouseEnter={() => setHoverLastTrickPopup(true)}
+            onMouseLeave={() => setHoverLastTrickPopup(false)}
             onClick={() => {
-              setClaimTricksInput(maxClaimableTricks);
-              setClaimModalOpen(true);
+              setHoverLastTrickPopup((prev) => !prev);
+              setHoverBoardPopup(false);
+              setHoverContractPopup(false);
             }}
           >
-            Claim
-          </button>
-        ) : (
-          <button
-            type="button"
-            className="rail-claim-btn"
-            onClick={() => {
-              setScoreModalOpen(true);
-            }}
-          >
-            Scores
-          </button>
-        )}
-      </aside>
+            <span>{game?.tricksWon.NS ?? 0}</span>
+            <span>{game?.tricksWon.EW ?? 0}</span>
+
+            {hoverLastTrickPopup && game && (
+              <div className="rail-hover-popover trick-popover">
+                <div className="popover-title">
+                  {lastTrick ? `Last Trick · Won by ${lastTrick.winner}` : 'Last Trick'}
+                </div>
+                {!lastTrick ? (
+                  <div className="popover-empty">No completed trick yet</div>
+                ) : (
+                  <div className="trick-mini-table">
+                    {lastTrick.cards.slice(0, animatedTrickCount).map((play, idx) => {
+                      const slot = visualSlotForSeat(play.seat);
+                      return (
+                        <div
+                          key={`${play.seat}-${idx}`}
+                          className={`trick-mini-slot trick-mini-${slot} trick-anim-pop`}
+                        >
+                          <span className="trick-mini-seat">{play.seat}</span>
+                          <HoverTrickCardPicture card={play.card} />
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {game && (
+            <button
+              type="button"
+              className={`rail-chat-btn ${chatOpen ? 'active' : ''}`}
+              onClick={() => setChatOpen((prev) => !prev)}
+              title="Table Chat (visible to all 4 players)"
+            >
+              <span>Chat</span>
+              {unreadChatCount > 0 && (
+                <span className="rail-chat-badge">
+                  {unreadChatCount > 99 ? '99+' : unreadChatCount}
+                </span>
+              )}
+            </button>
+          )}
+
+          {canDeclarerClaim ? (
+            <button
+              type="button"
+              className="rail-claim-btn"
+              onClick={() => {
+                setClaimTricksInput(maxClaimableTricks);
+                setClaimModalOpen(true);
+              }}
+            >
+              Claim
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="rail-claim-btn"
+              onClick={() => {
+                setScoreModalOpen(true);
+              }}
+            >
+              Scores
+            </button>
+          )}
+        </aside>
       )}
 
-      <main className="felt-stage">
+      <main className="felt-stage" style={{ boxSizing: 'border-box', overflowX: 'hidden', minWidth: 0 }}>
         {errorMsg && <div className="felt-toast-error">{errorMsg}</div>}
 
         {!game ? (
-          <div className="felt-join-overlay">
+          <div
+            className="felt-join-overlay"
+            style={{
+              position: 'fixed',
+              inset: 0,
+              width: '100%',
+              height: '100%',
+              padding: 16,
+              boxSizing: 'border-box',
+              overflowX: 'hidden',
+              overflowY: 'auto',
+              fontFamily: UI_FONT_FAMILY,
+              background:
+                'radial-gradient(circle at 50% 0%, #245e45 0%, #194532 60%, #113022 100%)',
+              color: '#f8fafc',
+              display: 'flex',
+              alignItems: 'stretch',
+              justifyContent: 'stretch',
+            }}
+          >
             <div
               className="felt-join-card"
-              style={{ width: 'min(540px, 94vw)', maxHeight: '88vh', overflowY: 'auto' }}
+              style={{
+                width: '100%',
+                minHeight: '100%',
+                maxWidth: '100%',
+                boxSizing: 'border-box',
+                overflowX: 'hidden',
+                display: 'flex',
+                flexDirection: 'column',
+                gap: 14,
+                padding: '18px 20px',
+                background: 'rgba(13, 38, 27, 0.72)',
+                border: '1px solid rgba(253, 224, 71, 0.28)',
+                borderRadius: 12,
+                boxShadow: '0 14px 36px rgba(0, 0, 0, 0.28)',
+              }}
             >
-              <h2>Contract Bridge Lobby</h2>
-              <p className="felt-conn-status">
-                {connected ? '● Server Online (:3001)' : '○ Connecting to Server (:3001)...'}
-              </p>
-
-              <div className="felt-lobby-form" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                <div>
-                  <label style={{ display: 'block', fontSize: 12, opacity: 0.85, marginBottom: 4 }}>
-                    Display Name
-                  </label>
-                  <input
-                    value={playerNameInput}
-                    onChange={(e) => setPlayerNameInput(e.target.value)}
-                    placeholder="Enter your name"
-                    className="felt-name-input"
-                    style={{ width: '100%' }}
-                  />
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'space-between',
+                  alignItems: 'center',
+                  gap: 12,
+                  flexWrap: 'wrap',
+                  paddingBottom: 12,
+                  borderBottom: '1px solid rgba(255, 255, 255, 0.16)',
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap', minWidth: 0 }}>
+                  <h2
+                    style={{
+                      margin: 0,
+                      fontFamily: UI_FONT_FAMILY,
+                      fontSize: 21,
+                      fontWeight: 700,
+                      letterSpacing: '-0.015em',
+                      color: '#ffffff',
+                    }}
+                  >
+                    Contract Bridge Lobby
+                  </h2>
+                  <span
+                    className="felt-conn-status"
+                    style={{
+                      margin: 0,
+                      fontSize: 12.5,
+                      fontWeight: 600,
+                      color: connected ? '#86efac' : '#fde68a',
+                    }}
+                  >
+                    {connected ? '● Server Online (:3001)' : '○ Connecting to Server (:3001)...'}
+                  </span>
                 </div>
 
-                {/* Available Rooms List */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  <button
+                    type="button"
+                    disabled
+                    aria-disabled="true"
+                    title="Tournament mode is currently a work in progress"
+                    style={{
+                      padding: '7px 13px',
+                      borderRadius: 7,
+                      fontFamily: UI_FONT_FAMILY,
+                      fontSize: 12.5,
+                      fontWeight: 600,
+                      border: '1px solid rgba(255, 255, 255, 0.16)',
+                      background: 'rgba(15, 23, 42, 0.35)',
+                      color: 'rgba(248, 250, 252, 0.45)',
+                      cursor: 'not-allowed',
+                    }}
+                  >
+                    🏆 Tournament (Work in Progress)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setLobbyTab('CASUAL');
+                      loadRooms();
+                    }}
+                    style={{
+                      padding: '7px 14px',
+                      borderRadius: 7,
+                      fontFamily: UI_FONT_FAMILY,
+                      fontSize: 12.5,
+                      fontWeight: 700,
+                      fontVariantNumeric: 'tabular-nums',
+                      border: '1px solid #eab308',
+                      background: '#facc15',
+                      color: '#0f172a',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    ♠ Casual Play (
+                    {
+                      availableRooms.filter(
+                        (r) => !getTournamentRoomCodesSet(tournamentList).has(r.id)
+                      ).length
+                    }
+                    )
+                  </button>
+                </div>
+              </div>
+
+              <div
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 12,
+                  flexWrap: 'wrap',
+                  background: '#f8f5ec',
+                  color: '#1e293b',
+                  border: '1px solid #d8d0c1',
+                  borderRadius: 10,
+                  padding: '10px 14px',
+                }}
+              >
+                <label
+                  style={{
+                    fontSize: 13,
+                    fontWeight: 700,
+                    color: '#143828',
+                  }}
+                >
+                  Display Name
+                </label>
+                <input
+                  value={playerNameInput}
+                  onChange={(e) => setPlayerNameInput(e.target.value)}
+                  placeholder="Enter your name"
+                  className="felt-name-input"
+                  style={{
+                    flex: '1 1 220px',
+                    maxWidth: 380,
+                    minWidth: 0,
+                    padding: '8px 11px',
+                    borderRadius: 6,
+                    fontFamily: UI_FONT_FAMILY,
+                    fontSize: 13.5,
+                    border: '1px solid #cbd5e1',
+                    background: '#ffffff',
+                    color: '#0f172a',
+                  }}
+                />
+              </div>
+
+              <div
+                style={{
+                  flex: 1,
+                  minHeight: 0,
+                  minWidth: 0,
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 340px), 1fr))',
+                  gap: 14,
+                  alignContent: 'stretch',
+                }}
+              >
+                {/* Casual Play: Available Rooms */}
                 <div
                   style={{
-                    background: 'rgba(0, 0, 0, 0.26)',
-                    border: '1px solid rgba(255, 255, 255, 0.16)',
+                    minWidth: 0,
+                    background: '#f8f5ec',
+                    color: '#1e293b',
+                    border: '1px solid #d8d0c1',
                     borderRadius: 10,
-                    padding: 10,
+                    padding: 14,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 10,
                   }}
                 >
                   <div
@@ -1773,11 +2196,26 @@ export default function App() {
                       display: 'flex',
                       justifyContent: 'space-between',
                       alignItems: 'center',
-                      marginBottom: 8,
-                      gap: 6,
+                      gap: 8,
+                      flexWrap: 'wrap',
                     }}
                   >
-                    <strong style={{ fontSize: 13 }}>Available Rooms ({availableRooms.length})</strong>
+                    <strong
+                      style={{
+                        fontSize: 14,
+                        fontWeight: 700,
+                        fontVariantNumeric: 'tabular-nums',
+                        color: '#143828',
+                      }}
+                    >
+                      Casual Rooms (
+                      {
+                        availableRooms.filter(
+                          (r) => !getTournamentRoomCodesSet(tournamentList).has(r.id)
+                        ).length
+                      }
+                      )
+                    </strong>
                     <div style={{ display: 'flex', gap: 6 }}>
                       <button
                         type="button"
@@ -1797,12 +2235,14 @@ export default function App() {
                         }}
                         title="Remove empty rooms"
                         style={{
-                          fontSize: 11,
-                          padding: '3px 9px',
-                          borderRadius: 5,
-                          border: '1px solid rgba(255,255,255,0.25)',
-                          background: 'rgba(255,255,255,0.1)',
-                          color: '#fff',
+                          fontFamily: UI_FONT_FAMILY,
+                          fontSize: 12,
+                          fontWeight: 600,
+                          padding: '5px 10px',
+                          borderRadius: 6,
+                          border: '1px solid #cbd5e1',
+                          background: '#ffffff',
+                          color: '#334155',
                           cursor: 'pointer',
                         }}
                       >
@@ -1812,12 +2252,14 @@ export default function App() {
                         type="button"
                         onClick={loadRooms}
                         style={{
-                          fontSize: 11,
-                          padding: '3px 10px',
-                          borderRadius: 5,
-                          border: '1px solid rgba(255,255,255,0.25)',
-                          background: 'rgba(255,255,255,0.1)',
-                          color: '#fff',
+                          fontFamily: UI_FONT_FAMILY,
+                          fontSize: 12,
+                          fontWeight: 600,
+                          padding: '5px 10px',
+                          borderRadius: 6,
+                          border: '1px solid #cbd5e1',
+                          background: '#ffffff',
+                          color: '#334155',
                           cursor: 'pointer',
                         }}
                       >
@@ -1826,144 +2268,164 @@ export default function App() {
                     </div>
                   </div>
 
-                  {availableRooms.length === 0 ? (
+                  {availableRooms.filter(
+                    (r) => !getTournamentRoomCodesSet(tournamentList).has(r.id)
+                  ).length === 0 ? (
                     <div
                       style={{
-                        padding: '14px 12px',
+                        flex: 1,
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        padding: '20px 14px',
                         borderRadius: 8,
-                        border: '1px dashed rgba(255,255,255,0.22)',
-                        background: 'rgba(255,255,255,0.03)',
+                        border: '1px dashed #b8afa0',
+                        background: '#ffffff',
                         textAlign: 'center',
-                        fontSize: 12.5,
-                        color: 'rgba(255,255,255,0.85)',
+                        fontSize: 13,
+                        lineHeight: 1.5,
+                        color: '#475569',
                       }}
                     >
-                      No active rooms right now. Create a room below to start a table.
+                      No active casual rooms right now. Create a room to start a table.
                     </div>
                   ) : (
                     <>
                       <div
                         style={{
+                          flex: 1,
+                          minHeight: 140,
                           display: 'flex',
                           flexDirection: 'column',
                           gap: 8,
-                          maxHeight: 230,
                           overflowY: 'auto',
                         }}
                       >
-                        {availableRooms.map((r) => {
-                          const isSelected = tableId === r.id;
-                          return (
-                            <div
-                              key={r.id}
-                              onClick={() => setTableId(r.id)}
-                              style={{
-                                padding: '9px 11px',
-                                borderRadius: 8,
-                                border: isSelected
-                                  ? '2px solid #facc15'
-                                  : '1px solid rgba(255,255,255,0.16)',
-                                background: isSelected
-                                  ? 'rgba(250, 204, 21, 0.14)'
-                                  : 'rgba(255, 255, 255, 0.04)',
-                                cursor: 'pointer',
-                                transition: 'all 0.15s ease',
-                              }}
-                            >
+                        {availableRooms
+                          .filter((r) => !getTournamentRoomCodesSet(tournamentList).has(r.id))
+                          .map((r) => {
+                            const isSelected = tableId === r.id;
+                            return (
                               <div
+                                key={r.id}
+                                onClick={() => setTableId(r.id)}
                                 style={{
-                                  display: 'flex',
-                                  justifyContent: 'space-between',
-                                  alignItems: 'center',
-                                  marginBottom: 6,
+                                  padding: '10px 12px',
+                                  borderRadius: 8,
+                                  border: isSelected
+                                    ? '2px solid #ca8a04'
+                                    : '1px solid #d6cfc2',
+                                  background: isSelected
+                                    ? '#fef9c3'
+                                    : '#ffffff',
+                                  color: '#1e293b',
+                                  cursor: 'pointer',
+                                  transition: 'all 0.15s ease',
                                 }}
                               >
-                                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                                  <strong style={{ fontSize: 14, color: isSelected ? '#facc15' : '#fff' }}>
-                                    {r.id}
-                                  </strong>
-                                  {r.hasPassword && (
-                                    <span
-                                      title="Password protected"
+                                <div
+                                  style={{
+                                    display: 'flex',
+                                    justifyContent: 'space-between',
+                                    alignItems: 'center',
+                                    marginBottom: 6,
+                                  }}
+                                >
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                    <strong
                                       style={{
-                                        fontSize: 11,
-                                        padding: '1px 6px',
-                                        borderRadius: 4,
-                                        background: 'rgba(234, 179, 8, 0.22)',
-                                        color: '#fde047',
-                                        border: '1px solid rgba(250, 204, 21, 0.4)',
+                                        fontSize: 14,
+                                        color: isSelected ? '#854d0e' : '#0f172a',
                                       }}
                                     >
-                                      🔒 Locked
-                                    </span>
-                                  )}
+                                      {r.id}
+                                    </strong>
+                                    {r.hasPassword && (
+                                      <span
+                                        title="Password protected"
+                                        style={{
+                                          fontSize: 11.5,
+                                          padding: '1px 6px',
+                                          borderRadius: 4,
+                                          background: '#fef3c7',
+                                          color: '#92400e',
+                                          border: '1px solid #f59e0b',
+                                        }}
+                                      >
+                                        🔒 Locked
+                                      </span>
+                                    )}
+                                  </div>
+                                  <span
+                                    style={{
+                                      fontSize: 12,
+                                      fontVariantNumeric: 'tabular-nums',
+                                      color: '#475569',
+                                    }}
+                                  >
+                                    Board #{r.boardNumber} · {r.occupiedCount}/4 seated
+                                  </span>
                                 </div>
-                                <span style={{ fontSize: 12, opacity: 0.85 }}>
-                                  Board #{r.boardNumber} · {r.occupiedCount}/4 seated
-                                </span>
-                              </div>
 
-                              {/* Seat selector chips inside each room list item */}
-                              <div
-                                style={{
-                                  display: 'grid',
-                                  gridTemplateColumns: 'repeat(4, 1fr)',
-                                  gap: 5,
-                                }}
-                              >
-                                {SEATS.map((s) => {
-                                  const occupant = r.seats?.[s];
-                                  const seatSelected = isSelected && selectedSeat === s;
-                                  return (
-                                    <button
-                                      key={s}
-                                      type="button"
-                                      disabled={Boolean(occupant)}
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        setTableId(r.id);
-                                        setSelectedSeat(s);
-                                      }}
-                                      title={
-                                        occupant
-                                          ? `${SEAT_FULL_NAME[s]} occupied by ${occupant}`
-                                          : `Select ${SEAT_FULL_NAME[s]} (${s})`
-                                      }
-                                      style={{
-                                        padding: '4px 6px',
-                                        borderRadius: 5,
-                                        fontSize: 11,
-                                        border: seatSelected
-                                          ? '1.5px solid #facc15'
-                                          : '1px solid rgba(255,255,255,0.2)',
-                                        background: occupant
-                                          ? 'rgba(148, 163, 184, 0.16)'
-                                          : seatSelected
-                                          ? 'rgba(250, 204, 21, 0.28)'
-                                          : 'rgba(22, 101, 52, 0.55)',
-                                        color: occupant ? 'rgba(255,255,255,0.55)' : '#fff',
-                                        cursor: occupant ? 'not-allowed' : 'pointer',
-                                        whiteSpace: 'nowrap',
-                                        overflow: 'hidden',
-                                        textOverflow: 'ellipsis',
-                                      }}
-                                    >
-                                      <strong>{s}:</strong> {occupant || 'Open'}
-                                    </button>
-                                  );
-                                })}
+                                <div
+                                  style={{
+                                    display: 'grid',
+                                    gridTemplateColumns: 'repeat(4, 1fr)',
+                                    gap: 5,
+                                  }}
+                                >
+                                  {SEATS.map((s) => {
+                                    const occupant = r.seats?.[s];
+                                    const seatSelected = isSelected && selectedSeat === s;
+                                    return (
+                                      <button
+                                        key={s}
+                                        type="button"
+                                        disabled={Boolean(occupant)}
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setTableId(r.id);
+                                          setSelectedSeat(s);
+                                        }}
+                                        title={
+                                          occupant
+                                            ? `${SEAT_FULL_NAME[s]} occupied by ${occupant}`
+                                            : `Select ${SEAT_FULL_NAME[s]} (${s})`
+                                        }
+                                        style={{
+                                          padding: '4px 6px',
+                                          borderRadius: 5,
+                                          fontFamily: UI_FONT_FAMILY,
+                                          fontSize: 11.5,
+                                          border: seatSelected
+                                            ? '1.5px solid #ca8a04'
+                                            : '1px solid #cbd5e1',
+                                          background: occupant
+                                            ? '#f1f5f9'
+                                            : seatSelected
+                                            ? '#fde047'
+                                            : '#dcfce7',
+                                          color: occupant ? '#64748b' : '#14532d',
+                                          cursor: occupant ? 'not-allowed' : 'pointer',
+                                          whiteSpace: 'nowrap',
+                                          overflow: 'hidden',
+                                          textOverflow: 'ellipsis',
+                                        }}
+                                      >
+                                        <strong>{s}:</strong> {occupant || 'Open'}
+                                      </button>
+                                    );
+                                  })}
+                                </div>
                               </div>
-                            </div>
-                          );
-                        })}
+                            );
+                          })}
                       </div>
 
-                      {/* Join selected room controls */}
                       <div
                         style={{
-                          marginTop: 10,
                           paddingTop: 10,
-                          borderTop: '1px solid rgba(255,255,255,0.14)',
+                          borderTop: '1px solid #d8d0c1',
                           display: 'flex',
                           flexDirection: 'column',
                           gap: 8,
@@ -1976,18 +2438,30 @@ export default function App() {
                               value={roomPasswordInput}
                               onChange={(e) => setRoomPasswordInput(e.target.value)}
                               placeholder={`Password for "${tableId}"`}
-                              style={{ flex: 1 }}
+                              style={{
+                                flex: 1,
+                                minWidth: 0,
+                                padding: '8px 11px',
+                                borderRadius: 6,
+                                fontFamily: UI_FONT_FAMILY,
+                                fontSize: 13,
+                                border: '1px solid #cbd5e1',
+                                background: '#ffffff',
+                                color: '#0f172a',
+                              }}
                             />
                             <button
                               type="button"
                               onClick={() => setShowRoomPassword((v) => !v)}
                               style={{
-                                padding: '6px 10px',
+                                padding: '7px 11px',
                                 borderRadius: 6,
-                                border: '1px solid rgba(255,255,255,0.25)',
-                                background: 'rgba(255,255,255,0.12)',
-                                color: '#fff',
+                                fontFamily: UI_FONT_FAMILY,
                                 fontSize: 12,
+                                fontWeight: 600,
+                                border: '1px solid #cbd5e1',
+                                background: '#ffffff',
+                                color: '#334155',
                                 cursor: 'pointer',
                                 whiteSpace: 'nowrap',
                               }}
@@ -1997,13 +2471,23 @@ export default function App() {
                           </div>
                         )}
 
-                        <div className="felt-join-row">
-                          <div style={{ flex: 1, fontSize: 12, opacity: 0.9 }}>
+                        <div className="felt-join-row" style={{ flexWrap: 'wrap', gap: 8 }}>
+                          <div style={{ flex: '1 1 120px', minWidth: 0, fontSize: 12.5, color: '#334155' }}>
                             Joining: <strong>{tableId || availableRooms[0]?.id}</strong>
                           </div>
                           <select
                             value={selectedSeat}
                             onChange={(e) => setSelectedSeat(e.target.value as Seat)}
+                            style={{
+                              minWidth: 0,
+                              padding: '8px 10px',
+                              borderRadius: 6,
+                              fontFamily: UI_FONT_FAMILY,
+                              fontSize: 13,
+                              border: '1px solid #cbd5e1',
+                              background: '#ffffff',
+                              color: '#0f172a',
+                            }}
                           >
                             {SEATS.map((s) => {
                               const activeRoomObj = availableRooms.find(
@@ -2019,8 +2503,32 @@ export default function App() {
                           </select>
                           <button
                             type="button"
-                            className="rail-claim-btn"
-                            onClick={() => joinSeat(selectedSeat, tableId || availableRooms[0]?.id)}
+                            onClick={() => {
+                              const targetId =
+                                tableId ||
+                                availableRooms.filter(
+                                  (r) => !getTournamentRoomCodesSet(tournamentList).has(r.id)
+                                )[0]?.id;
+                              if (!targetId) return;
+                              if (getTournamentRoomCodesSet(tournamentList).has(targetId)) {
+                                setErrorMsg(
+                                  'Tournament rooms are currently a work in progress.'
+                                );
+                                return;
+                              }
+                              joinSeat(selectedSeat, targetId);
+                            }}
+                            style={{
+                              padding: '8px 14px',
+                              borderRadius: 7,
+                              fontFamily: UI_FONT_FAMILY,
+                              fontSize: 13,
+                              fontWeight: 700,
+                              border: '1px solid #ca8a04',
+                              background: '#facc15',
+                              color: '#0f172a',
+                              cursor: 'pointer',
+                            }}
                           >
                             Join Room
                           </button>
@@ -2030,78 +2538,145 @@ export default function App() {
                   )}
                 </div>
 
-                {/* Create New Room Section */}
+                {/* Casual Play: Create a New Room */}
                 <div
                   style={{
-                    background: 'rgba(0, 0, 0, 0.22)',
-                    border: '1px solid rgba(255, 255, 255, 0.16)',
+                    minWidth: 0,
+                    background: '#f8f5ec',
+                    color: '#1e293b',
+                    border: '1px solid #d8d0c1',
                     borderRadius: 10,
-                    padding: 10,
+                    padding: 14,
                     display: 'flex',
                     flexDirection: 'column',
-                    gap: 8,
+                    justifyContent: 'space-between',
+                    gap: 12,
                   }}
                 >
-                  <strong style={{ fontSize: 13 }}>Create a New Room</strong>
-                  <div style={{ display: 'flex', gap: 6 }}>
-                    <input
-                      value={newRoomName}
-                      onChange={(e) => setNewRoomName(e.target.value)}
-                      placeholder="New room name (e.g. friday-club)"
-                      style={{ flex: 1 }}
-                    />
-                    <select
-                      value={newRoomSeat}
-                      onChange={(e) => setNewRoomSeat(e.target.value as Seat)}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    <strong
+                      style={{
+                        fontSize: 14,
+                        fontWeight: 700,
+                        color: '#143828',
+                      }}
                     >
-                      {SEATS.map((s) => (
-                        <option key={s} value={s}>
-                          Seat {s} ({SEAT_FULL_NAME[s]})
-                        </option>
-                      ))}
-                    </select>
+                      Create a Casual Room
+                    </strong>
+                    <div style={{ fontSize: 12.5, lineHeight: 1.45, color: '#475569' }}>
+                      Start a casual table with optional password protection.
+                    </div>
+                    <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                      <input
+                        value={newRoomName}
+                        onChange={(e) => setNewRoomName(e.target.value)}
+                        placeholder="New room name (e.g. friday-club)"
+                        style={{
+                          flex: '1 1 180px',
+                          minWidth: 0,
+                          padding: '8px 11px',
+                          borderRadius: 6,
+                          fontFamily: UI_FONT_FAMILY,
+                          fontSize: 13,
+                          border: '1px solid #cbd5e1',
+                          background: '#ffffff',
+                          color: '#0f172a',
+                        }}
+                      />
+                      <select
+                        value={newRoomSeat}
+                        onChange={(e) => setNewRoomSeat(e.target.value as Seat)}
+                        style={{
+                          flex: '0 1 150px',
+                          minWidth: 0,
+                          padding: '8px 10px',
+                          borderRadius: 6,
+                          fontFamily: UI_FONT_FAMILY,
+                          fontSize: 13,
+                          border: '1px solid #cbd5e1',
+                          background: '#ffffff',
+                          color: '#0f172a',
+                        }}
+                      >
+                        {SEATS.map((s) => (
+                          <option key={s} value={s}>
+                            Seat {s} ({SEAT_FULL_NAME[s]})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                      <input
+                        type={showNewRoomPassword ? 'text' : 'password'}
+                        value={newRoomPassword}
+                        onChange={(e) => setNewRoomPassword(e.target.value)}
+                        placeholder="Optional room password"
+                        style={{
+                          flex: '1 1 180px',
+                          minWidth: 0,
+                          padding: '8px 11px',
+                          borderRadius: 6,
+                          fontFamily: UI_FONT_FAMILY,
+                          fontSize: 13,
+                          border: '1px solid #cbd5e1',
+                          background: '#ffffff',
+                          color: '#0f172a',
+                        }}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowNewRoomPassword((v) => !v)}
+                        style={{
+                          padding: '8px 12px',
+                          borderRadius: 6,
+                          fontFamily: UI_FONT_FAMILY,
+                          fontSize: 12,
+                          fontWeight: 600,
+                          border: '1px solid #cbd5e1',
+                          background: '#ffffff',
+                          color: '#334155',
+                          cursor: 'pointer',
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        {showNewRoomPassword ? 'Hide' : 'Show'}
+                      </button>
+                    </div>
                   </div>
 
-                  <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                    <input
-                      type={showNewRoomPassword ? 'text' : 'password'}
-                      value={newRoomPassword}
-                      onChange={(e) => setNewRoomPassword(e.target.value)}
-                      placeholder="Optional room password"
-                      style={{ flex: 1 }}
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowNewRoomPassword((v) => !v)}
-                      style={{
-                        padding: '6px 10px',
-                        borderRadius: 6,
-                        border: '1px solid rgba(255,255,255,0.25)',
-                        background: 'rgba(255,255,255,0.12)',
-                        color: '#fff',
-                        fontSize: 12,
-                        cursor: 'pointer',
-                        whiteSpace: 'nowrap',
-                      }}
-                    >
-                      {showNewRoomPassword ? 'Hide' : 'Show'}
-                    </button>
-                    <button
-                      type="button"
-                      className="rail-claim-btn"
-                      disabled={!newRoomName.trim()}
-                      onClick={() => {
-                        const createdId = newRoomName.trim();
-                        if (!createdId) return;
-                        setTableId(createdId);
-                        setSelectedSeat(newRoomSeat);
-                        setRoomPasswordInput(newRoomPassword);
-                        joinSeat(newRoomSeat, createdId, newRoomPassword);
-                      }}
-                    >
-                      Create &amp; Sit
-                    </button>
-                  </div>
+                  <button
+                    type="button"
+                    disabled={!newRoomName.trim()}
+                    style={{
+                      width: '100%',
+                      padding: '9px 14px',
+                      borderRadius: 7,
+                      fontFamily: UI_FONT_FAMILY,
+                      border: newRoomName.trim() ? '1px solid #ca8a04' : '1px solid #cbd5e1',
+                      fontWeight: 700,
+                      fontSize: 13.5,
+                      background: newRoomName.trim() ? '#facc15' : '#e2e8f0',
+                      color: newRoomName.trim() ? '#0f172a' : '#64748b',
+                      cursor: newRoomName.trim() ? 'pointer' : 'not-allowed',
+                    }}
+                    onClick={() => {
+                      const createdId = newRoomName.trim();
+                      if (!createdId) return;
+                      if (getTournamentRoomCodesSet(tournamentList).has(createdId)) {
+                        setErrorMsg(
+                          'Tournament rooms are currently a work in progress.'
+                        );
+                        return;
+                      }
+                      setTableId(createdId);
+                      setSelectedSeat(newRoomSeat);
+                      setRoomPasswordInput(newRoomPassword);
+                      joinSeat(newRoomSeat, createdId, newRoomPassword);
+                    }}
+                  >
+                    Create &amp; Sit
+                  </button>
                 </div>
               </div>
             </div>
@@ -2134,6 +2709,7 @@ export default function App() {
               >
                 <span className="felt-seat-tag">{topSeat}</span>
                 <span className="felt-player-name">{formatSeatLabel(topSeat)}</span>
+                {renderSeatKickButton(topSeat)}
               </div>
             </div>
 
@@ -2164,6 +2740,7 @@ export default function App() {
                 >
                   <span className="felt-seat-tag">{leftSeat}</span>
                   <span className="felt-player-name">{formatSeatLabel(leftSeat)}</span>
+                  {renderSeatKickButton(leftSeat)}
                 </div>
               </div>
 
@@ -2329,27 +2906,27 @@ export default function App() {
 
                     {selectedBidLevel !== null && auctionStatus.isLevelLegal(selectedBidLevel) && (
                       <div className="felt-strain-row">
-                        {STRAIN_ORDER.filter((st) => auctionStatus.isStrainLegal(selectedBidLevel, st)).map(
-                          (st) => (
-                            <button
-                              key={st}
-                              type="button"
-                              className="felt-strain-btn"
-                              onClick={() =>
-                                sendBid({
-                                  type: 'CONTRACT',
-                                  level: selectedBidLevel,
-                                  strain: st,
-                                })
-                              }
-                            >
-                              <span className="bid-text-black">{selectedBidLevel}</span>
-                              <span className={isRedStrain(st) ? 'suit-red' : 'suit-black'}>
-                                {SUIT_SYM[st]}
-                              </span>
-                            </button>
-                          )
-                        )}
+                        {STRAIN_ORDER.filter((st) =>
+                          auctionStatus.isStrainLegal(selectedBidLevel, st)
+                        ).map((st) => (
+                          <button
+                            key={st}
+                            type="button"
+                            className="felt-strain-btn"
+                            onClick={() =>
+                              sendBid({
+                                type: 'CONTRACT',
+                                level: selectedBidLevel,
+                                strain: st,
+                              })
+                            }
+                          >
+                            <span className="bid-text-black">{selectedBidLevel}</span>
+                            <span className={isRedStrain(st) ? 'suit-red' : 'suit-black'}>
+                              {SUIT_SYM[st]}
+                            </span>
+                          </button>
+                        ))}
                       </div>
                     )}
                   </div>
@@ -2393,6 +2970,7 @@ export default function App() {
                 >
                   <span className="felt-seat-tag">{rightSeat}</span>
                   <span className="felt-player-name">{formatSeatLabel(rightSeat)}</span>
+                  {renderSeatKickButton(rightSeat)}
                 </div>
               </div>
             </div>
@@ -2409,20 +2987,23 @@ export default function App() {
                   />
                 </div>
               ) : (
-              <div className="felt-strip-row bottom-hand-strip" style={{ width: `${Math.max(bottomCards.length, 0) * 56}px` }}>
-                {bottomCards.map((c, idx) => (
-                  <StripCardFace
-                    key={`${c.suit}-${c.rank}-${idx}`}
-                    card={c}
-                    disabled={
-                      c.rank === 0 ||
-                      !(game.phase === 'PLAYING' && isMyTurn && activeHandSeat === bottomSeat)
-                    }
-                    onClick={() => sendCard(c)}
-                    highlighted={game.currentTurn === bottomSeat}
-                  />
-                ))}
-              </div>
+                <div
+                  className="felt-strip-row bottom-hand-strip"
+                  style={{ width: `${Math.max(bottomCards.length, 0) * 56}px` }}
+                >
+                  {bottomCards.map((c, idx) => (
+                    <StripCardFace
+                      key={`${c.suit}-${c.rank}-${idx}`}
+                      card={c}
+                      disabled={
+                        c.rank === 0 ||
+                        !(game.phase === 'PLAYING' && isMyTurn && activeHandSeat === bottomSeat)
+                      }
+                      onClick={() => sendCard(c)}
+                      highlighted={game.currentTurn === bottomSeat}
+                    />
+                  ))}
+                </div>
               )}
               <div
                 className={`felt-bottom-bar ${
@@ -2540,7 +3121,11 @@ export default function App() {
                 <button type="button" className="claim-accept-btn" onClick={submitClaim}>
                   Submit Claim
                 </button>
-                <button type="button" className="claim-cancel-btn" onClick={() => setClaimModalOpen(false)}>
+                <button
+                  type="button"
+                  className="claim-cancel-btn"
+                  onClick={() => setClaimModalOpen(false)}
+                >
                   Cancel
                 </button>
               </div>
@@ -2939,8 +3524,83 @@ export default function App() {
                   className="felt-drawer-name-input"
                 />
 
+                {game && (
+                  <div
+                    style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 6,
+                      marginTop: 8,
+                      padding: 8,
+                      borderRadius: 8,
+                      background: 'rgba(0, 0, 0, 0.25)',
+                      border: '1px solid rgba(255, 255, 255, 0.14)',
+                    }}
+                  >
+                    <div style={{ fontSize: 12, fontWeight: 600 }}>
+                      Table Seats ({tableId})
+                    </div>
+                    {SEATS.map((s) => {
+                      const occupant = seatNames[s];
+                      const isSelfSeat = mySeat === s;
+                      return (
+                        <div
+                          key={s}
+                          style={{
+                            display: 'flex',
+                            justifyContent: 'space-between',
+                            alignItems: 'center',
+                            gap: 8,
+                            padding: '5px 8px',
+                            borderRadius: 6,
+                            background: 'rgba(255, 255, 255, 0.05)',
+                            fontSize: 12,
+                          }}
+                        >
+                          <span>
+                            <strong>{s}</strong> ({SEAT_FULL_NAME[s]}):{' '}
+                            {occupant ? (
+                              <>
+                                <span>{occupant}</span>
+                                {isSelfSeat ? ' (You)' : ''}
+                              </>
+                            ) : (
+                              <span style={{ opacity: 0.65 }}>Open</span>
+                            )}
+                          </span>
+                          {occupant && (
+                            <button
+                              type="button"
+                              onClick={() => removeSeatOccupant(s)}
+                              style={{
+                                padding: '3px 8px',
+                                borderRadius: 5,
+                                border: '1px solid rgba(248, 113, 113, 0.55)',
+                                background: 'rgba(185, 28, 28, 0.78)',
+                                color: '#fff',
+                                fontSize: 11,
+                                fontWeight: 600,
+                                cursor: 'pointer',
+                              }}
+                            >
+                              {isSelfSeat ? 'Leave Seat' : 'Remove'}
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 8 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 12 }}>
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      fontSize: 12,
+                    }}
+                  >
                     <span>Available Rooms</span>
                     <button
                       type="button"
@@ -2950,13 +3610,28 @@ export default function App() {
                       Refresh
                     </button>
                   </div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 5, maxHeight: 160, overflowY: 'auto' }}>
-                    {availableRooms.length === 0 ? (
-                      <div style={{ fontSize: 11.5, opacity: 0.8, padding: '6px 4px' }}>
-                        No active rooms. Create a room from the lobby.
-                      </div>
-                    ) : (
-                      availableRooms.map((r) => {
+                  <div
+                    style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 5,
+                      maxHeight: 160,
+                      overflowY: 'auto',
+                    }}
+                  >
+                    {(() => {
+                      const tournamentRoomCodes = getTournamentRoomCodesSet(tournamentList);
+                      const standardDrawerRooms = availableRooms.filter(
+                        (r) => !tournamentRoomCodes.has(r.id)
+                      );
+                      if (standardDrawerRooms.length === 0) {
+                        return (
+                          <div style={{ fontSize: 11.5, opacity: 0.8, padding: '6px 4px' }}>
+                            No active rooms. Create a room from the lobby.
+                          </div>
+                        );
+                      }
+                      return standardDrawerRooms.map((r) => {
                         const active = tableId === r.id;
                         return (
                           <button
@@ -2969,7 +3644,9 @@ export default function App() {
                               alignItems: 'center',
                               padding: '6px 9px',
                               borderRadius: 6,
-                              border: active ? '2px solid #facc15' : '1px solid rgba(255,255,255,0.22)',
+                              border: active
+                                ? '2px solid #facc15'
+                                : '1px solid rgba(255,255,255,0.22)',
                               background: active ? 'rgba(250, 204, 21, 0.2)' : 'rgba(0,0,0,0.25)',
                               color: '#fff',
                               fontSize: 12,
@@ -2983,8 +3660,8 @@ export default function App() {
                             <span style={{ opacity: 0.8 }}>{r.occupiedCount}/4</span>
                           </button>
                         );
-                      })
-                    )}
+                      });
+                    })()}
                   </div>
                 </div>
 
@@ -2994,7 +3671,7 @@ export default function App() {
                     value={roomPasswordInput}
                     onChange={(e) => setRoomPasswordInput(e.target.value)}
                     placeholder="Room password (optional)"
-                    style={{ flex: 1 }}
+                    style={{ flex: 1, minWidth: 0 }}
                   />
                   <button
                     type="button"
@@ -3010,6 +3687,7 @@ export default function App() {
                     value={tableId}
                     onChange={(e) => setTableId(e.target.value)}
                     placeholder="Room ID"
+                    style={{ minWidth: 0 }}
                   />
                   <select
                     value={selectedSeat}
@@ -3020,7 +3698,8 @@ export default function App() {
                       const occupant = activeRoomObj?.seats?.[s];
                       return (
                         <option key={s} value={s}>
-                          {s}{occupant ? ` (${occupant})` : ''}
+                          {s}
+                          {occupant ? ` (${occupant})` : ''}
                         </option>
                       );
                     })}
@@ -3028,7 +3707,15 @@ export default function App() {
                   <button
                     type="button"
                     className="rail-claim-btn"
-                    onClick={() => joinSeat(selectedSeat)}
+                    onClick={() => {
+                      if (getTournamentRoomCodesSet(tournamentList).has(tableId.trim())) {
+                        setErrorMsg(
+                          'Tournament rooms are currently a work in progress.'
+                        );
+                        return;
+                      }
+                      joinSeat(selectedSeat);
+                    }}
                   >
                     Sit
                   </button>
@@ -3049,6 +3736,24 @@ export default function App() {
                     <span style={{ fontSize: 12, opacity: 0.85 }}>
                       Room: <strong>{tableId}</strong>
                     </span>
+                    <button
+                      type="button"
+                      disabled
+                      aria-disabled="true"
+                      title="Tournament mode is currently a work in progress"
+                      style={{
+                        padding: '6px 10px',
+                        borderRadius: 6,
+                        border: '1px solid rgba(255, 255, 255, 0.2)',
+                        background: 'rgba(255, 255, 255, 0.06)',
+                        color: 'rgba(255, 255, 255, 0.5)',
+                        fontSize: 12,
+                        fontWeight: 600,
+                        cursor: 'not-allowed',
+                      }}
+                    >
+                      Tournament (WIP)
+                    </button>
                     <button
                       type="button"
                       onClick={leaveTable}
@@ -3134,8 +3839,12 @@ export default function App() {
                   <tfoot>
                     <tr className="scorecard-total-row">
                       <td colSpan={2}>Total</td>
-                      <td className="scorecard-total-yellow" style={{ textAlign: 'center' }}>{cumulativeScore.NS}</td>
-                      <td className="scorecard-total-yellow" style={{ textAlign: 'center' }}>{cumulativeScore.EW}</td>
+                      <td className="scorecard-total-yellow" style={{ textAlign: 'center' }}>
+                        {cumulativeScore.NS}
+                      </td>
+                      <td className="scorecard-total-yellow" style={{ textAlign: 'center' }}>
+                        {cumulativeScore.EW}
+                      </td>
                     </tr>
                   </tfoot>
                 </table>
@@ -3143,6 +3852,7 @@ export default function App() {
             </div>
           </div>
         )}
+
         {game && chatOpen && (
           <section className="room-chat-panel" aria-label="In-room table chat">
             <div className="room-chat-header">
@@ -3211,6 +3921,7 @@ export default function App() {
           </section>
         )}
       </main>
+
       {hoveredBidPopover && (
         <div
           className="bid-explanation-popover"

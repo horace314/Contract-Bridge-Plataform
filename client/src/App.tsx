@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
 
 type Seat = 'N' | 'E' | 'S' | 'W';
@@ -24,6 +24,14 @@ interface AuctionEntry {
   explanationRequestedBy?: Seat[];
 }
 
+interface ChatMessage {
+  id: string;
+  seat: Seat | 'SPECTATOR';
+  senderName: string;
+  text: string;
+  timestamp: number;
+}
+
 interface ClaimState {
   claimedBy: Seat;
   claimedDeclarerTricks: number;
@@ -32,12 +40,24 @@ interface ClaimState {
   rejectedRevealed: boolean;
 }
 
+interface AcceptedClaimRecord {
+  claimedBy: Seat;
+  claimedDeclarerTricks: number;
+  acceptedBy: Seat[];
+  partialTrick: { seat: Seat; card: Card }[];
+  completedTricksCount: number;
+  acceptedAtTrickNumber?: number;
+  acceptedAtCardIndex?: number;
+  acceptedAtCard?: { seat: Seat; card: Card } | null;
+}
+
 interface GameState {
   boardNumber: number;
   dealer: Seat;
   vulnerability: 'NONE' | 'NS' | 'EW' | 'BOTH';
   phase: 'WAITING' | 'BIDDING' | 'PLAYING' | 'FINISHED';
   hands: Partial<Record<Seat, Card[]>>;
+  initialHands?: Partial<Record<Seat, Card[]>>;
   auction: AuctionEntry[];
   contract: { level: number; strain: Strain; declarer: Seat; doubled: 0 | 1 | 2 } | null;
   dummy: Seat | null;
@@ -47,6 +67,12 @@ interface GameState {
   tricksWon: { NS: number; EW: number };
   score: { NS: number; EW: number } | null;
   claim: ClaimState | null;
+  acceptedClaim?: AcceptedClaimRecord | null;
+}
+
+interface CompletedTrickRecord {
+  winner: Seat;
+  cards: { seat: Seat; card: Card }[];
 }
 
 interface CompletedBoardRecord {
@@ -60,6 +86,10 @@ interface CompletedBoardRecord {
   tricks_ew: number;
   score_ns: number;
   score_ew: number;
+  tricks_history?: CompletedTrickRecord[];
+  initial_hands?: Partial<Record<Seat, Card[]>>;
+  auction?: AuctionEntry[];
+  accepted_claim?: AcceptedClaimRecord | null;
   pbn: string;
 }
 
@@ -136,17 +166,108 @@ function sortCardsBySuitOrder(cards: Card[], suitOrder: Suit[]): Card[] {
   });
 }
 
+function parseHandsFromPbn(pbn: string): Partial<Record<Seat, Card[]>> {
+  const dealMatch = pbn.match(/\[Deal\s+"([NESW]):([^"]+)"\]/i);
+  if (!dealMatch) return {};
+  const startSeat = dealMatch[1].toUpperCase() as Seat;
+  const startIdx = SEATS.indexOf(startSeat);
+  const handChunks = dealMatch[2].trim().split(/\s+/);
+  const rankMap: Record<string, number> = {
+    A: 14, K: 13, Q: 12, J: 11, T: 10,
+    '9': 9, '8': 8, '7': 7, '6': 6, '5': 5, '4': 4, '3': 3, '2': 2,
+  };
+  const suitOrder: Suit[] = ['S', 'H', 'D', 'C'];
+  const result: Partial<Record<Seat, Card[]>> = {};
+
+  handChunks.forEach((hStr, idx) => {
+    const seat = SEATS[(startIdx + idx) % 4];
+    const suitParts = hStr.split('.');
+    const cards: Card[] = [];
+    suitParts.forEach((part, sIdx) => {
+      const suit = suitOrder[sIdx];
+      if (!suit || !part) return;
+      for (const ch of part) {
+        const r = rankMap[ch.toUpperCase()];
+        if (r) cards.push({ suit, rank: r });
+      }
+    });
+    result[seat] = cards;
+  });
+  return result;
+}
+
+function parseTricksFromPbn(pbn: string): CompletedTrickRecord[] {
+  const playMatch = pbn.match(/\[Play\s+"([^"]+)"\]/i);
+  if (!playMatch) return [];
+  const tokens = playMatch[1].trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return [];
+
+  const suitMap: Record<string, Suit> = {
+    S: 'S', H: 'H', D: 'D', C: 'C',
+    s: 'S', h: 'H', d: 'D', c: 'C',
+  };
+  const rankMap: Record<string, number> = {
+    A: 14, K: 13, Q: 12, J: 11, T: 10,
+    '9': 9, '8': 8, '7': 7, '6': 6, '5': 5, '4': 4, '3': 3, '2': 2,
+  };
+
+  const seatMatch = pbn.match(/\[PlaySeat\s+"([NESW])"\]/i);
+  let leader: Seat = (seatMatch?.[1]?.toUpperCase() as Seat) || 'N';
+
+  const parsedCards: { seat: Seat; card: Card }[] = [];
+  for (const tok of tokens) {
+    if (tok === '-' || tok.length < 2) continue;
+    const s = suitMap[tok[0]];
+    const r = rankMap[tok[1]];
+    if (!s || !r) continue;
+    const playSeat = SEATS[(SEATS.indexOf(leader) + (parsedCards.length % 4)) % 4];
+    parsedCards.push({ seat: playSeat, card: { suit: s, rank: r } });
+    if (parsedCards.length % 4 === 0) {
+      const chunk = parsedCards.slice(-4);
+      const leadSuit = chunk[0].card.suit;
+      let winIdx = 0;
+      for (let i = 1; i < chunk.length; i++) {
+        if (chunk[i].card.suit === leadSuit && chunk[i].card.rank > chunk[winIdx].card.rank) {
+          winIdx = i;
+        }
+      }
+      leader = chunk[winIdx].seat;
+    }
+  }
+
+  const tricks: CompletedTrickRecord[] = [];
+  for (let i = 0; i < parsedCards.length; i += 4) {
+    const chunk = parsedCards.slice(i, i + 4);
+    if (chunk.length === 0) continue;
+    const leadSuit = chunk[0].card.suit;
+    let winIdx = 0;
+    for (let j = 1; j < chunk.length; j++) {
+      if (chunk[j].card.suit === leadSuit && chunk[j].card.rank > chunk[winIdx].card.rank) {
+        winIdx = j;
+      }
+    }
+    const winner = chunk[winIdx].seat;
+    tricks.push({ winner, cards: chunk });
+  }
+  return tricks;
+}
+
 function formatContractAndResult(board: CompletedBoardRecord): {
   contractLabel: string;
   resultLabel: string;
+  compactResult: string;
 } {
   if (!board.contract_text || board.contract_text === 'Pass') {
-    return { contractLabel: 'Pass', resultLabel: 'Passed Out' };
+    return { contractLabel: 'Pass', resultLabel: 'Passed Out', compactResult: 'Pass' };
   }
 
   const levelMatch = board.contract_text.match(/^([1-7])(C|D|H|S|NT)(XX|X)?$/);
   if (!levelMatch) {
-    return { contractLabel: board.contract_text, resultLabel: '-' };
+    return {
+      contractLabel: board.contract_text,
+      resultLabel: '-',
+      compactResult: board.contract_text,
+    };
   }
 
   const level = Number(levelMatch[1]);
@@ -162,13 +283,10 @@ function formatContractAndResult(board: CompletedBoardRecord): {
   const target = 6 + level;
   const diff = tricksMade - target;
 
-  if (diff === 0) {
-    return { contractLabel, resultLabel: '=' };
-  }
-  if (diff > 0) {
-    return { contractLabel, resultLabel: `+${diff}` };
-  }
-  return { contractLabel, resultLabel: `-${Math.abs(diff)}` };
+  const resultLabel = diff === 0 ? '=' : diff > 0 ? `+${diff}` : `-${Math.abs(diff)}`;
+  const compactResult = `${level}${sym}${doubledSuffix}${board.declarer || ''}${resultLabel}`;
+
+  return { contractLabel, resultLabel, compactResult };
 }
 
 function getAuctionLegalStatus(
@@ -405,9 +523,68 @@ function HoverTrickCardPicture({ card }: { card: Card }) {
   const sym = SUIT_SYM[card.suit];
   const lbl = rankLabel(card.rank);
   return (
-    <div className={`hover-pic-card ${red ? 'suit-red' : 'suit-black'}`}>
-      <span className="hover-pic-rank">{lbl}</span>
-      <span className="hover-pic-pip">{sym}</span>
+    <div className="hover-pic-card">
+      <span className="hover-pic-rank bid-text-black">{lbl}</span>
+      <span className={`hover-pic-pip ${red ? 'suit-red' : 'suit-black'}`}>{sym}</span>
+    </div>
+  );
+}
+
+function ReplaySuitHandBox({
+  seat,
+  label,
+  cards,
+  playedSet,
+  highlightTop,
+}: {
+  seat: Seat;
+  label: string;
+  cards: Card[];
+  playedSet: Set<string>;
+  highlightTop?: boolean;
+}) {
+  const suits: Suit[] = ['S', 'H', 'D', 'C'];
+  return (
+    <div className="replay-hand-box">
+      <div className={`replay-hand-header ${highlightTop ? 'is-highlight' : ''}`}>
+        <span className="replay-seat-badge">{seat}</span>
+        <span className="replay-seat-name">{label}</span>
+      </div>
+      <div className="replay-hand-suits">
+        {suits.map((suit) => {
+          const suitCards = cards
+            .filter((c) => c.suit === suit)
+            .sort((a, b) => b.rank - a.rank);
+          const red = isRedSuit(suit);
+          return (
+            <div key={suit} className="replay-suit-line">
+              <span className={`replay-suit-sym ${red ? 'suit-red' : 'suit-black'}`}>
+                {SUIT_SYM[suit]}
+              </span>
+              <span className="replay-suit-ranks">
+                {suitCards.length === 0 ? (
+                  <span className="replay-void-dash">—</span>
+                ) : (
+                  suitCards.map((c, idx) => {
+                    const key = `${c.suit}-${c.rank}`;
+                    const isPlayed = playedSet.has(key);
+                    return (
+                      <span
+                        key={`${key}-${idx}`}
+                        className={`replay-rank-token bid-text-black ${
+                          isPlayed ? 'is-played' : ''
+                        }`}
+                      >
+                        {rankLabel(c.rank)}
+                      </span>
+                    );
+                  })
+                )}
+              </span>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -439,7 +616,7 @@ export default function App() {
   const [history, setHistory] = useState<CompletedBoardRecord[]>([]);
   const [selectedBoardPreview, setSelectedBoardPreview] = useState<number>(1);
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const [drawerTab, setDrawerTab] = useState<'scoreboard' | 'boards' | 'pbn'>('scoreboard');
+  const [scoreModalOpen, setScoreModalOpen] = useState(false);
   const [cumulativeScore, setCumulativeScore] = useState<{ NS: number; EW: number }>({
     NS: 0,
     EW: 0,
@@ -451,6 +628,81 @@ export default function App() {
   const [animatedTrickCount, setAnimatedTrickCount] = useState(0);
   const [claimModalOpen, setClaimModalOpen] = useState(false);
   const [claimTricksInput, setClaimTricksInput] = useState<number>(1);
+  const [historyModalBoard, setHistoryModalBoard] = useState<CompletedBoardRecord | null>(null);
+  const [historyViewMode, setHistoryViewMode] = useState<'bidding' | 'play'>('bidding');
+  const [selectedTrickIdx, setSelectedTrickIdx] = useState<number>(0);
+  const [revealedCardStep, setRevealedCardStep] = useState<number>(4);
+  const [showClaimSummary, setShowClaimSummary] = useState<boolean>(false);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [chatInput, setChatInput] = useState('');
+  const [unreadChatCount, setUnreadChatCount] = useState(0);
+  const chatOpenRef = useRef(chatOpen);
+  const chatBottomRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    chatOpenRef.current = chatOpen;
+    if (chatOpen) {
+      setUnreadChatCount(0);
+      setTimeout(() => {
+        chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+      }, 30);
+    }
+  }, [chatOpen]);
+
+  useEffect(() => {
+    if (chatOpen) {
+      chatBottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [chatMessages, chatOpen]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      if (hoveredBidPopover) {
+        setHoveredBidPopover(null);
+        return;
+      }
+      if (explainingBidIndex !== null) {
+        setExplainingBidIndex(null);
+        setExplanationInput('');
+        return;
+      }
+      if (claimModalOpen) {
+        setClaimModalOpen(false);
+        return;
+      }
+      if (historyModalBoard) {
+        setHistoryModalBoard(null);
+        return;
+      }
+      if (drawerOpen) {
+        setDrawerOpen(false);
+        return;
+      }
+      if (scoreModalOpen) {
+        setScoreModalOpen(false);
+        return;
+      }
+      if (chatOpen) {
+        setChatOpen(false);
+        return;
+      }
+      setHoverBoardPopup(false);
+      setHoverContractPopup(false);
+      setHoverLastTrickPopup(false);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [
+    hoveredBidPopover,
+    explainingBidIndex,
+    claimModalOpen,
+    historyModalBoard,
+    drawerOpen,
+    scoreModalOpen,
+    chatOpen,
+  ]);
 
   useEffect(() => {
     const s = io(SERVER_URL);
@@ -477,6 +729,9 @@ export default function App() {
       if (payload.seatNames) {
         setSeatNames(payload.seatNames);
       }
+      if (Array.isArray(payload.chatMessages)) {
+        setChatMessages(payload.chatMessages);
+      }
       if (payload.playerName) {
         setPlayerNameInput(payload.playerName);
         localStorage.setItem('bridge_player_name', payload.playerName);
@@ -501,6 +756,16 @@ export default function App() {
       setErrorMsg('');
     });
 
+    s.on('chat_message', (msg: ChatMessage) => {
+      setChatMessages((prev) => {
+        if (prev.some((m) => m.id === msg.id)) return prev;
+        return [...prev, msg];
+      });
+      if (!chatOpenRef.current) {
+        setUnreadChatCount((c) => c + 1);
+      }
+    });
+
     s.on('error_msg', (msg: string) => {
       setErrorMsg(msg);
     });
@@ -509,6 +774,66 @@ export default function App() {
       s.disconnect();
     };
   }, []);
+
+  // Build replay entries capped at accepted claim when one exists
+  const modalAcceptedClaim: AcceptedClaimRecord | null = historyModalBoard?.accepted_claim ?? null;
+  const rawTricks: CompletedTrickRecord[] = historyModalBoard
+    ? historyModalBoard.tricks_history && historyModalBoard.tricks_history.length > 0
+      ? historyModalBoard.tricks_history
+      : parseTricksFromPbn(historyModalBoard.pbn || '')
+    : [];
+
+  const claimCutoffTrickIdx = (() => {
+    if (!modalAcceptedClaim) return null;
+    if (typeof modalAcceptedClaim.acceptedAtTrickNumber === 'number' && modalAcceptedClaim.acceptedAtTrickNumber > 0) {
+      return Math.max(0, modalAcceptedClaim.acceptedAtTrickNumber - 1);
+    }
+    return null;
+  })();
+
+  const claimCutoffCardStep = (() => {
+    if (!modalAcceptedClaim) return null;
+    if (typeof modalAcceptedClaim.acceptedAtCardIndex === 'number' && modalAcceptedClaim.acceptedAtCardIndex >= 0) {
+      return modalAcceptedClaim.acceptedAtCardIndex;
+    }
+    return null;
+  })();
+
+  const modalTricks: CompletedTrickRecord[] = (() => {
+    if (!historyModalBoard) return [];
+    if (modalAcceptedClaim) {
+      const limitTrickCount =
+        claimCutoffTrickIdx !== null
+          ? Math.min(rawTricks.length, claimCutoffTrickIdx + 1)
+          : modalAcceptedClaim.completedTricksCount;
+      const capped = rawTricks.slice(0, limitTrickCount);
+      if (modalAcceptedClaim.partialTrick && modalAcceptedClaim.partialTrick.length > 0) {
+        const lastIsPartial =
+          capped.length > 0 &&
+          capped[capped.length - 1].cards.length === modalAcceptedClaim.partialTrick.length &&
+          capped[capped.length - 1].cards.every(
+            (c, idx) =>
+              c.seat === modalAcceptedClaim.partialTrick[idx].seat &&
+              c.card.suit === modalAcceptedClaim.partialTrick[idx].card.suit &&
+              c.card.rank === modalAcceptedClaim.partialTrick[idx].card.rank
+          );
+        if (!lastIsPartial) {
+          capped.push({
+            winner: modalAcceptedClaim.claimedBy,
+            cards: modalAcceptedClaim.partialTrick,
+          });
+        }
+      }
+      return capped;
+    }
+    return rawTricks;
+  })();
+
+  useEffect(() => {
+    if (!historyModalBoard) {
+      setShowClaimSummary(false);
+    }
+  }, [historyModalBoard]);
 
   const lastTrick =
     game && game.tricksHistory.length > 0
@@ -639,6 +964,14 @@ export default function App() {
     socket?.emit('respond_claim', { tableId, accept });
   };
 
+  const sendChatMessage = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    const trimmed = chatInput.trim();
+    if (!trimmed || !socket) return;
+    socket.emit('send_chat', { tableId, text: trimmed });
+    setChatInput('');
+  };
+
   const nextBoard = () => {
     setDisplayedTrick([]);
     socket?.emit('next_board', { tableId });
@@ -696,8 +1029,27 @@ export default function App() {
     return 'right';
   };
 
+  const isDeclarerOrDummyViewer = Boolean(
+    game &&
+      mySeat &&
+      (game.contract?.declarer === mySeat || game.dummy === mySeat)
+  );
+
+  const isOpponentOfDeclarerOrDummy = (seat: Seat): boolean =>
+    Boolean(isDeclarerOrDummyViewer && mySeat && sideOf(seat) !== sideOf(mySeat));
+
   const dummyModeForSeat = (seat: Seat): 'declarer-dummy' | 'defender-dummy' => {
+    if (game?.phase === 'FINISHED' && isOpponentOfDeclarerOrDummy(seat)) {
+      return 'defender-dummy';
+    }
     if (game?.dummy === seat && isDefender) {
+      return 'defender-dummy';
+    }
+    if (
+      isDefender &&
+      game?.contract?.declarer === seat &&
+      Boolean(game?.claim || game?.acceptedClaim)
+    ) {
       return 'defender-dummy';
     }
     return 'declarer-dummy';
@@ -705,6 +1057,9 @@ export default function App() {
 
   const contractSuitOrder = getSuitOrderForContract(game?.contract?.strain);
   const bottomCards = sortCardsBySuitOrder(game?.hands[bottomSeat] || [], contractSuitOrder);
+  const isClaimRevealed = Boolean(
+    game?.claim || game?.acceptedClaim || game?.phase === 'FINISHED'
+  );
   const topCards = game?.hands[topSeat] || [];
   const topIsFaceUp = topCards.some((c) => c.rank > 0);
   const leftCards = game?.hands[leftSeat] || [];
@@ -898,11 +1253,144 @@ export default function App() {
               </button>
             </div>
           )}
-
-
       </div>
     );
   };
+
+  // Helper to resolve initial hands & auction for a board in history modal
+  const modalHands: Partial<Record<Seat, Card[]>> = historyModalBoard
+    ? historyModalBoard.initial_hands &&
+      Object.keys(historyModalBoard.initial_hands).length > 0
+      ? historyModalBoard.initial_hands
+      : game && game.boardNumber === historyModalBoard.board_number && game.initialHands
+      ? game.initialHands
+      : parseHandsFromPbn(historyModalBoard.pbn || '')
+    : {};
+
+  const modalAuction: AuctionEntry[] = historyModalBoard
+    ? historyModalBoard.auction && historyModalBoard.auction.length > 0
+      ? historyModalBoard.auction
+      : game && game.boardNumber === historyModalBoard.board_number
+      ? game.auction
+      : []
+    : [];
+
+  const modalDealer: Seat = (historyModalBoard?.dealer as Seat) || 'N';
+  const modalVul = historyModalBoard?.vulnerability || 'NONE';
+
+  const modalAuctionRows: (AuctionEntry | null)[][] = (() => {
+    const startIdx = auctionCols.indexOf(modalDealer);
+    const flat: (AuctionEntry | null)[] = Array(startIdx).fill(null);
+    modalAuction.forEach((entry) => flat.push(entry));
+    while (flat.length % 4 !== 0) flat.push(null);
+    const rows: (AuctionEntry | null)[][] = [];
+    for (let i = 0; i < flat.length; i += 4) {
+      rows.push(flat.slice(i, i + 4));
+    }
+    return rows;
+  })();
+
+  // Set of cards played up to current trick / card step in replay mode
+  const playedCardKeysUpToStep = new Set<string>();
+  if (historyModalBoard && historyViewMode === 'play') {
+    for (let t = 0; t < selectedTrickIdx; t++) {
+      for (const play of modalTricks[t]?.cards || []) {
+        playedCardKeysUpToStep.add(`${play.card.suit}-${play.card.rank}`);
+      }
+    }
+    const curTrickCards = modalTricks[selectedTrickIdx]?.cards || [];
+    for (let p = 0; p < Math.min(revealedCardStep, curTrickCards.length); p++) {
+      const play = curTrickCards[p];
+      playedCardKeysUpToStep.add(`${play.card.suit}-${play.card.rank}`);
+    }
+  }
+
+  const effectiveMaxStepForTrick = (tIdx: number): number => {
+    const trickLen = modalTricks[tIdx]?.cards.length || 0;
+    if (modalAcceptedClaim && claimCutoffTrickIdx !== null && tIdx === claimCutoffTrickIdx && claimCutoffCardStep !== null) {
+      return Math.min(trickLen, claimCutoffCardStep);
+    }
+    return trickLen;
+  };
+
+  const maxReplayTrickIdx =
+    modalAcceptedClaim && claimCutoffTrickIdx !== null
+      ? Math.min(Math.max(0, modalTricks.length - 1), claimCutoffTrickIdx)
+      : Math.max(0, modalTricks.length - 1);
+
+  const isAtLastCardBeforeClaim = Boolean(
+    modalAcceptedClaim &&
+      historyViewMode === 'play' &&
+      modalTricks.length > 0 &&
+      selectedTrickIdx === maxReplayTrickIdx &&
+      revealedCardStep >= effectiveMaxStepForTrick(maxReplayTrickIdx)
+  );
+
+  const isAtAcceptedClaimCutoff = Boolean(isAtLastCardBeforeClaim && showClaimSummary);
+
+  const replayTricksTally: { NS: number; EW: number } = (() => {
+    if (!historyModalBoard) {
+      return { NS: 0, EW: 0 };
+    }
+    if (isAtAcceptedClaimCutoff && modalAcceptedClaim) {
+      return {
+        NS: historyModalBoard.tricks_ns,
+        EW: historyModalBoard.tricks_ew,
+      };
+    }
+    if (historyViewMode !== 'play' || modalTricks.length === 0) {
+      return { NS: 0, EW: 0 };
+    }
+    let ns = 0;
+    let ew = 0;
+    const completedBeforeCurrent = Math.min(selectedTrickIdx, modalTricks.length);
+    for (let t = 0; t < completedBeforeCurrent; t++) {
+      const tr = modalTricks[t];
+      if (!tr) continue;
+      if (sideOf(tr.winner) === 'NS') ns += 1;
+      else ew += 1;
+    }
+    const curTrick = modalTricks[selectedTrickIdx];
+    const curMaxStep = effectiveMaxStepForTrick(selectedTrickIdx);
+    if (curTrick && curTrick.cards.length > 0 && revealedCardStep >= curTrick.cards.length && revealedCardStep >= curMaxStep) {
+      if (sideOf(curTrick.winner) === 'NS') ns += 1;
+      else ew += 1;
+    }
+    return { NS: ns, EW: ew };
+  })();
+
+  const currentHistoryIdx = historyModalBoard
+    ? history.findIndex((b) => b.id === historyModalBoard.id)
+    : -1;
+  const prevHistoryBoard: CompletedBoardRecord | null =
+    currentHistoryIdx >= 0 && history.length > 1
+      ? history[(currentHistoryIdx - 1 + history.length) % history.length]
+      : null;
+  const nextHistoryBoard: CompletedBoardRecord | null =
+    currentHistoryIdx >= 0 && history.length > 1
+      ? history[(currentHistoryIdx + 1) % history.length]
+      : null;
+
+  const cardPlayedBeforeClaim: { seat: Seat; card: Card } | null = (() => {
+    if (!modalAcceptedClaim || modalTricks.length === 0) return null;
+    if (modalAcceptedClaim.acceptedAtCard) {
+      return modalAcceptedClaim.acceptedAtCard;
+    }
+    const tIdx = Math.min(maxReplayTrickIdx, Math.max(0, modalTricks.length - 1));
+    const trickCards = modalTricks[tIdx]?.cards || [];
+    const maxStep = effectiveMaxStepForTrick(tIdx);
+    const stepIdx = maxStep > 0 ? Math.min(trickCards.length - 1, maxStep - 1) : -1;
+    if (stepIdx >= 0 && trickCards[stepIdx]) {
+      return trickCards[stepIdx];
+    }
+    for (let i = tIdx - 1; i >= 0; i--) {
+      const prevCards = modalTricks[i]?.cards || [];
+      if (prevCards.length > 0) {
+        return prevCards[prevCards.length - 1];
+      }
+    }
+    return null;
+  })();
 
   const vulClass = `vul-${(game?.vulnerability || 'NONE').toLowerCase()}`;
 
@@ -919,7 +1407,12 @@ export default function App() {
         </button>
 
         <div
-          className={`rail-board-box hover-anchor ${vulClass}`}
+          className={`rail-board-box has-dealer-edge dealer-${(game?.dealer || 'N').toLowerCase()} hover-anchor ${vulClass}`}
+          style={{
+            padding: 12,
+            borderWidth: 14,
+            position: 'relative',
+          }}
           onMouseEnter={() => setHoverBoardPopup(true)}
           onMouseLeave={() => setHoverBoardPopup(false)}
           onClick={() => {
@@ -928,43 +1421,93 @@ export default function App() {
             setHoverLastTrickPopup(false);
           }}
         >
+          <span
+            className="rail-dealer-edge-mark"
+            style={{
+              position: 'absolute',
+              fontSize: 11,
+              fontWeight: 800,
+              lineHeight: 1,
+              pointerEvents: 'none',
+              color:
+                (game?.vulnerability === 'BOTH' ||
+                  (game?.vulnerability === 'NS' &&
+                    ((game?.dealer ?? 'N') === 'N' || (game?.dealer ?? 'N') === 'S')) ||
+                  (game?.vulnerability === 'EW' &&
+                    ((game?.dealer ?? 'N') === 'E' || (game?.dealer ?? 'N') === 'W')))
+                  ? '#ffffff'
+                  : '#111827',
+              ...((game?.dealer ?? 'N') === 'N'
+                ? { top: -13, left: '50%', transform: 'translateX(-50%)' }
+                : (game?.dealer ?? 'N') === 'S'
+                ? { bottom: -13, left: '50%', transform: 'translateX(-50%)' }
+                : (game?.dealer ?? 'N') === 'W'
+                ? { left: -13, top: '50%', transform: 'translateY(-50%)' }
+                : { right: -13, top: '50%', transform: 'translateY(-50%)' }),
+            }}
+          >
+            D
+          </span>
           <div className="rail-board-inner">
             <div className="rail-board-num">{game?.boardNumber ?? 1}</div>
-            <div className="rail-board-dealer">{game?.dealer ?? 'N'}</div>
           </div>
 
           {hoverBoardPopup && (
-            <div className="rail-hover-popover board-scores-popover">
-              <div className="popover-title">Scoreboard</div>
-              {history.length === 0 ? (
-                <div className="popover-empty">No completed boards yet</div>
-              ) : (
-                <table className="board-hover-score-table">
+            <div
+              className="rail-hover-popover board-scores-popover"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="popover-title">Table &amp; Duplicate Records</div>
+              <div className="scorecard-sheet-wrap">
+                <table className="scorecard-sheet-table">
                   <thead>
                     <tr>
                       <th>Board</th>
-                      <th>Contract</th>
                       <th>Result</th>
-                      <th>NS</th>
-                      <th>EW</th>
+                      <th>We</th>
+                      <th>They</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {history.map((b) => {
-                      const info = formatContractAndResult(b);
-                      return (
-                        <tr key={b.id}>
-                          <td>#{b.board_number}</td>
-                          <td>{info.contractLabel}</td>
-                          <td>{info.resultLabel}</td>
-                          <td>{b.score_ns}</td>
-                          <td>{b.score_ew}</td>
-                        </tr>
-                      );
-                    })}
+                    {history.length === 0 ? (
+                      <tr>
+                        <td colSpan={4} className="scorecard-empty-cell">
+                          No completed boards yet.
+                        </td>
+                      </tr>
+                    ) : (
+                      history.map((b, idx) => {
+                        const info = formatContractAndResult(b);
+                        const isEven = idx % 2 === 1;
+                        return (
+                          <tr
+                            key={b.id}
+                            className={`scorecard-row ${isEven ? 'alt-row' : ''}`}
+                          >
+                            <td>{b.board_number}</td>
+                            <td className="scorecard-result-cell">
+                              <span>{info.compactResult}</span>
+                            </td>
+                            <td className="scorecard-pts-cell" style={{ textAlign: 'center' }}>
+                              {b.score_ns > 0 ? b.score_ns : ''}
+                            </td>
+                            <td className="scorecard-pts-cell" style={{ textAlign: 'center' }}>
+                              {b.score_ew > 0 ? b.score_ew : ''}
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
                   </tbody>
+                  <tfoot>
+                    <tr className="scorecard-total-row">
+                      <td colSpan={2}>Total</td>
+                      <td className="scorecard-total-yellow" style={{ textAlign: 'center' }}>{cumulativeScore.NS}</td>
+                      <td className="scorecard-total-yellow" style={{ textAlign: 'center' }}>{cumulativeScore.EW}</td>
+                    </tr>
+                  </tfoot>
                 </table>
-              )}
+              </div>
             </div>
           )}
         </div>
@@ -1004,7 +1547,7 @@ export default function App() {
                       ? 'XX'
                       : ''
                   } - ${game.contract.declarer}`
-                : displayNameForSeat(game.contract.declarer)
+                : game.contract.declarer
               : 'Auction'}
           </div>
 
@@ -1073,6 +1616,22 @@ export default function App() {
           )}
         </div>
 
+        {game && (
+          <button
+            type="button"
+            className={`rail-chat-btn ${chatOpen ? 'active' : ''}`}
+            onClick={() => setChatOpen((prev) => !prev)}
+            title="Table Chat (visible to all 4 players)"
+          >
+            <span>Chat</span>
+            {unreadChatCount > 0 && (
+              <span className="rail-chat-badge">
+                {unreadChatCount > 99 ? '99+' : unreadChatCount}
+              </span>
+            )}
+          </button>
+        )}
+
         {canDeclarerClaim ? (
           <button
             type="button"
@@ -1089,8 +1648,7 @@ export default function App() {
             type="button"
             className="rail-claim-btn"
             onClick={() => {
-              setDrawerTab('scoreboard');
-              setDrawerOpen(true);
+              setScoreModalOpen(true);
             }}
           >
             Scores
@@ -1099,16 +1657,6 @@ export default function App() {
       </aside>
 
       <main className="felt-stage">
-        {game && game.phase !== 'FINISHED' && (
-          <div className={`felt-turn-notification ${isMyTurn ? 'my-turn-notify' : ''}`}>
-            <span className="turn-notify-dot">●</span>
-            <span>
-              Turn: <strong>{turnDisplayLabel}</strong>
-              {isMyTurn ? ' (Your Turn)' : ''}
-            </span>
-          </div>
-        )}
-
         {errorMsg && <div className="felt-toast-error">{errorMsg}</div>}
 
         {!game ? (
@@ -1155,7 +1703,7 @@ export default function App() {
         ) : (
           <>
             <div className="seat-zone-top">
-              {topIsFaceUp ? (
+              {topIsFaceUp || isClaimRevealed ? (
                 <HorizontalSuitHand
                   cards={topCards}
                   canPlayCard={(c) =>
@@ -1185,7 +1733,7 @@ export default function App() {
 
             <div className="seat-zone-middle">
               <div className="seat-zone-side">
-                {leftIsFaceUp ? (
+                {leftIsFaceUp || isClaimRevealed ? (
                   <HorizontalSuitHand
                     cards={leftCards}
                     canPlayCard={(c) =>
@@ -1214,6 +1762,16 @@ export default function App() {
               </div>
 
               <div className="center-table-area">
+                {game && game.phase !== 'FINISHED' && (
+                  <div className={`felt-turn-notification ${isMyTurn ? 'my-turn-notify' : ''}`}>
+                    <span className="turn-notify-dot">●</span>
+                    <span>
+                      Turn: <strong>{turnDisplayLabel}</strong>
+                      {isMyTurn ? ' (Your Turn)' : ''}
+                    </span>
+                  </div>
+                )}
+
                 {game.claim && !game.claim.rejectedRevealed && (
                   <div className="felt-claim-banner">
                     <div>
@@ -1267,14 +1825,30 @@ export default function App() {
                 {game.phase === 'BIDDING' ? (
                   <div className="felt-auction-board">
                     <div className="felt-auction-header">
-                      {auctionCols.map((col, idx) => (
-                        <div
-                          key={col}
-                          className={`felt-auction-col-title ${idx === 0 ? 'vul-col' : ''}`}
-                        >
-                          {col}
-                        </div>
-                      ))}
+                      {auctionCols.map((col) => {
+                        const isSeatVul =
+                          game.vulnerability === 'BOTH' ||
+                          (game.vulnerability === 'NS' && (col === 'N' || col === 'S')) ||
+                          (game.vulnerability === 'EW' && (col === 'E' || col === 'W'));
+                        return (
+                          <div
+                            key={col}
+                            className={`felt-auction-col-title ${isSeatVul ? 'is-vul-seat' : ''}`}
+                            style={
+                              isSeatVul
+                                ? {
+                                    background: '#dc2626',
+                                    backgroundColor: '#dc2626',
+                                    color: '#ffffff',
+                                    borderRadius: 4,
+                                  }
+                                : undefined
+                            }
+                          >
+                            {col}
+                          </div>
+                        );
+                      })}
                     </div>
                     <div className="felt-auction-body">
                       {auctionRows.map((row, rIdx) => (
@@ -1388,7 +1962,7 @@ export default function App() {
               </div>
 
               <div className="seat-zone-side">
-                {rightIsFaceUp ? (
+                {rightIsFaceUp || isClaimRevealed ? (
                   <HorizontalSuitHand
                     cards={rightCards}
                     canPlayCard={(c) =>
@@ -1418,7 +1992,18 @@ export default function App() {
             </div>
 
             <div className={`seat-zone-bottom ${isMyTurn ? 'my-turn-hand-border' : ''}`}>
-              <div className="felt-strip-row bottom-hand-strip">
+              {game.phase === 'FINISHED' && dummyModeForSeat(bottomSeat) === 'defender-dummy' ? (
+                <div className="finished-bottom-suit-wrap">
+                  <HorizontalSuitHand
+                    cards={bottomCards}
+                    canPlayCard={() => false}
+                    onPlayCard={() => {}}
+                    mode="defender-dummy"
+                    suitOrder={contractSuitOrder}
+                  />
+                </div>
+              ) : (
+              <div className="felt-strip-row bottom-hand-strip" style={{ width: `${Math.max(bottomCards.length, 0) * 56}px` }}>
                 {bottomCards.map((c, idx) => (
                   <StripCardFace
                     key={`${c.suit}-${c.rank}-${idx}`}
@@ -1432,6 +2017,7 @@ export default function App() {
                   />
                 ))}
               </div>
+              )}
               <div
                 className={`felt-bottom-bar ${
                   isMyTurn ? 'my-move-active' : 'my-move-idle'
@@ -1556,11 +2142,386 @@ export default function App() {
           </div>
         )}
 
+        {historyModalBoard && (
+          <div
+            className="felt-drawer-backdrop board-history-backdrop"
+            onClick={() => setHistoryModalBoard(null)}
+          >
+            <div
+              className="board-history-modal replay-table-modal"
+              onClick={(e) => e.stopPropagation()}
+              role="dialog"
+              aria-modal="true"
+              aria-label={`Board ${historyModalBoard.board_number} History`}
+            >
+              <div className="replay-top-bar">
+
+
+                <div className="replay-title-meta">
+                  <strong>Board #{historyModalBoard.board_number}</strong> ·{' '}
+                  {formatContractAndResult(historyModalBoard).contractLabel} (
+                  {formatContractAndResult(historyModalBoard).resultLabel}) · Vul: {modalVul}
+                </div>
+
+                <button
+                  type="button"
+                  className="board-history-close"
+                  onClick={() => setHistoryModalBoard(null)}
+                >
+                  ✕
+                </button>
+              </div>
+
+              <div className="replay-green-stage">
+                <div className="replay-top-row">
+                  <div
+                    className={`rail-board-box has-dealer-edge dealer-${modalDealer.toLowerCase()} replay-board-badge-box vul-${modalVul.toLowerCase()}`}
+                    style={{
+                      padding: 12,
+                      borderWidth: 14,
+                      position: 'relative',
+                    }}
+                  >
+                    <span
+                      className="rail-dealer-edge-mark"
+                      style={{
+                        position: 'absolute',
+                        fontSize: 11,
+                        fontWeight: 800,
+                        lineHeight: 1,
+                        pointerEvents: 'none',
+                        color:
+                          modalVul === 'BOTH' ||
+                          (modalVul === 'NS' && (modalDealer === 'N' || modalDealer === 'S')) ||
+                          (modalVul === 'EW' && (modalDealer === 'E' || modalDealer === 'W'))
+                            ? '#ffffff'
+                            : '#111827',
+                        ...(modalDealer === 'N'
+                          ? { top: -13, left: '50%', transform: 'translateX(-50%)' }
+                          : modalDealer === 'S'
+                          ? { bottom: -13, left: '50%', transform: 'translateX(-50%)' }
+                          : modalDealer === 'W'
+                          ? { left: -13, top: '50%', transform: 'translateY(-50%)' }
+                          : { right: -13, top: '50%', transform: 'translateY(-50%)' }),
+                      }}
+                    >
+                      D
+                    </span>
+                    <div className="rail-board-inner">
+                      <div className="rail-board-num">{historyModalBoard.board_number}</div>
+                    </div>
+                  </div>
+
+                  <ReplaySuitHandBox
+                    seat="N"
+                    label={displayNameForSeat('N')}
+                    cards={modalHands.N || []}
+                    playedSet={playedCardKeysUpToStep}
+                    highlightTop={Boolean(
+                      isAtAcceptedClaimCutoff &&
+                        modalAcceptedClaim &&
+                        sideOf(modalAcceptedClaim.claimedBy) === 'NS'
+                    )}
+                  />
+
+                  <div className="replay-top-spacer" />
+                </div>
+
+                <div className="replay-mid-row">
+                  <ReplaySuitHandBox
+                    seat="W"
+                    label={displayNameForSeat('W')}
+                    cards={modalHands.W || []}
+                    playedSet={playedCardKeysUpToStep}
+                  />
+
+                  <div className="replay-center-panel">
+                    {historyViewMode === 'bidding' && !isAtAcceptedClaimCutoff ? (
+                      <div className="replay-auction-card">
+                        <div className="replay-auction-head">
+                          {auctionCols.map((c) => (
+                            <div key={c}>{c}</div>
+                          ))}
+                        </div>
+                        <div className="replay-auction-grid">
+                          {modalAuctionRows.map((row, rIdx) =>
+                            row.map((entry, cIdx) => (
+                              <div key={`${rIdx}-${cIdx}`} className="replay-auction-call">
+                                {entry ? renderColoredBidCall(entry.call) : ''}
+                              </div>
+                            ))
+                          )}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="replay-trick-arena">
+                        <>
+                          {modalTricks[selectedTrickIdx]?.cards
+                            .slice(0, revealedCardStep)
+                            .map((play, pIdx) => {
+                              const slotPos =
+                                play.seat === 'N'
+                                  ? 'slot-n'
+                                  : play.seat === 'S'
+                                  ? 'slot-s'
+                                  : play.seat === 'W'
+                                  ? 'slot-w'
+                                  : 'slot-e';
+                              return (
+                                <div
+                                  key={`${play.seat}-${pIdx}`}
+                                  className={`replay-played-slot ${slotPos}`}
+                                  title={`#${pIdx + 1} ${play.seat}`}
+                                >
+                                  <HoverTrickCardPicture card={play.card} />
+                                </div>
+                              );
+                            })}
+                        </>
+                        {isAtAcceptedClaimCutoff && modalAcceptedClaim && (
+                          <div
+                            className="felt-claim-banner"
+                            style={{
+                              position: 'fixed',
+                              top: '50%',
+                              left: '50%',
+                              transform: 'translate(-50%, -50%)',
+                              zIndex: 1200,
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              textAlign: 'center',
+                              minHeight: 72,
+                              padding: '14px 20px',
+                            }}
+                          >
+                            <div
+                              style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                justifyContent: 'center',
+                                textAlign: 'center',
+                                width: '100%',
+                                height: '100%',
+                              }}
+                            >
+                              <span style={{ whiteSpace: 'pre-wrap' }}>
+                                <strong>{displayNameForSeat(modalAcceptedClaim.claimedBy)}</strong>
+                                {' claims '}
+                                <strong>{modalAcceptedClaim.claimedDeclarerTricks}</strong>
+                                {' total tricks accepted ('}
+                                {historyModalBoard.score_ns >= 0
+                                  ? `+${historyModalBoard.score_ns}`
+                                  : historyModalBoard.score_ns}
+                                {').'}
+                              </span>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+
+                  <ReplaySuitHandBox
+                    seat="E"
+                    label={displayNameForSeat('E')}
+                    cards={modalHands.E || []}
+                    playedSet={playedCardKeysUpToStep}
+                  />
+                </div>
+
+                <div className="replay-bottom-row">
+                  <ReplaySuitHandBox
+                    seat="S"
+                    label={displayNameForSeat('S')}
+                    cards={modalHands.S || []}
+                    playedSet={playedCardKeysUpToStep}
+                  />
+
+                  <div className="replay-contract-tally-box">
+                    <div className="replay-contract-summary">
+                      <div>{historyModalBoard.contract_text || 'Pass'}</div>
+                      <div>{historyModalBoard.declarer || '—'}</div>
+                    </div>
+                    <div className="replay-tricks-tally">
+                      <span>{replayTricksTally.NS}</span>
+                      <span>{replayTricksTally.EW}</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div className="replay-nav-footer">
+                <button
+                  type="button"
+                  className="replay-nav-btn active"
+                  disabled={!prevHistoryBoard}
+                  onClick={() => {
+                    if (!prevHistoryBoard) return;
+                    setHistoryModalBoard(prevHistoryBoard);
+                    setHistoryViewMode('bidding');
+                    setSelectedTrickIdx(0);
+                    setRevealedCardStep(0);
+                    setShowClaimSummary(false);
+                  }}
+                >
+                  Previous deal
+                </button>
+                <button
+                  type="button"
+                  className="replay-nav-btn active"
+                  disabled={!nextHistoryBoard}
+                  onClick={() => {
+                    if (!nextHistoryBoard) return;
+                    setHistoryModalBoard(nextHistoryBoard);
+                    setHistoryViewMode('bidding');
+                    setSelectedTrickIdx(0);
+                    setRevealedCardStep(0);
+                    setShowClaimSummary(false);
+                  }}
+                >
+                  Next deal
+                </button>
+                <button
+                  type="button"
+                  className="replay-nav-btn active"
+                  disabled={
+                    historyViewMode !== 'play' ||
+                    (!showClaimSummary && selectedTrickIdx === 0 && revealedCardStep <= 1)
+                  }
+                  onClick={() => {
+                    if (historyViewMode !== 'play') {
+                      setHistoryViewMode('play');
+                      return;
+                    }
+                    if (showClaimSummary) {
+                      setShowClaimSummary(false);
+                      return;
+                    }
+                    if (revealedCardStep > 1) {
+                      setRevealedCardStep((s) => s - 1);
+                    } else if (selectedTrickIdx > 0) {
+                      const prevIdx = selectedTrickIdx - 1;
+                      setSelectedTrickIdx(prevIdx);
+                      setRevealedCardStep(modalTricks[prevIdx]?.cards.length || 4);
+                    }
+                  }}
+                >
+                  Previous card
+                </button>
+                <button
+                  type="button"
+                  className="replay-nav-btn active"
+                  disabled={
+                    modalTricks.length === 0 ||
+                    (historyViewMode === 'play' &&
+                      selectedTrickIdx === maxReplayTrickIdx &&
+                      revealedCardStep >= effectiveMaxStepForTrick(maxReplayTrickIdx) &&
+                      (!modalAcceptedClaim || showClaimSummary))
+                  }
+                  onClick={() => {
+                    if (historyViewMode !== 'play') {
+                      setHistoryViewMode('play');
+                      setShowClaimSummary(false);
+                      setSelectedTrickIdx(0);
+                      setRevealedCardStep(effectiveMaxStepForTrick(0) > 0 ? 1 : 0);
+                      return;
+                    }
+                    const curMax = effectiveMaxStepForTrick(selectedTrickIdx);
+                    if (revealedCardStep < curMax) {
+                      setRevealedCardStep((s) => Math.min(curMax, s + 1));
+                    } else if (selectedTrickIdx < maxReplayTrickIdx) {
+                      const nextIdx = selectedTrickIdx + 1;
+                      setSelectedTrickIdx(nextIdx);
+                      setRevealedCardStep(effectiveMaxStepForTrick(nextIdx) > 0 ? 1 : 0);
+                    } else if (modalAcceptedClaim && !showClaimSummary) {
+                      setShowClaimSummary(true);
+                    }
+                  }}
+                >
+                  Next card
+                </button>
+                <button
+                  type="button"
+                  className="replay-nav-btn active"
+                  disabled={
+                    modalTricks.length === 0 ||
+                    (historyViewMode === 'play' &&
+                      !showClaimSummary &&
+                      selectedTrickIdx === 0 &&
+                      revealedCardStep <= 0)
+                  }
+                  onClick={() => {
+                    if (historyViewMode !== 'play') {
+                      setHistoryViewMode('play');
+                      setShowClaimSummary(false);
+                      setSelectedTrickIdx(0);
+                      setRevealedCardStep(0);
+                      return;
+                    }
+                    if (showClaimSummary) {
+                      setShowClaimSummary(false);
+                      setSelectedTrickIdx(maxReplayTrickIdx);
+                      setRevealedCardStep(effectiveMaxStepForTrick(maxReplayTrickIdx));
+                      return;
+                    }
+                    if (revealedCardStep > 0) {
+                      setRevealedCardStep(0);
+                      return;
+                    }
+                    if (selectedTrickIdx > 0) {
+                      const prevIdx = selectedTrickIdx - 1;
+                      setSelectedTrickIdx(prevIdx);
+                      setRevealedCardStep(0);
+                    }
+                  }}
+                >
+                  Previous trick
+                </button>
+                <button
+                  type="button"
+                  className="replay-nav-btn active"
+                  disabled={
+                    modalTricks.length === 0 ||
+                    (historyViewMode === 'play' &&
+                      selectedTrickIdx >= maxReplayTrickIdx &&
+                      revealedCardStep >= effectiveMaxStepForTrick(maxReplayTrickIdx) &&
+                      (!modalAcceptedClaim || showClaimSummary))
+                  }
+                  onClick={() => {
+                    if (historyViewMode !== 'play') {
+                      setHistoryViewMode('play');
+                      setShowClaimSummary(false);
+                      setSelectedTrickIdx(0);
+                      setRevealedCardStep(effectiveMaxStepForTrick(0));
+                      return;
+                    }
+                    if (
+                      selectedTrickIdx >= maxReplayTrickIdx &&
+                      revealedCardStep >= effectiveMaxStepForTrick(maxReplayTrickIdx)
+                    ) {
+                      if (modalAcceptedClaim && !showClaimSummary) {
+                        setShowClaimSummary(true);
+                      }
+                      return;
+                    }
+                    const nextIdx = Math.min(maxReplayTrickIdx, selectedTrickIdx + 1);
+                    setSelectedTrickIdx(nextIdx);
+                    setRevealedCardStep(effectiveMaxStepForTrick(nextIdx));
+                  }}
+                >
+                  Next trick
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
         {drawerOpen && (
           <div className="felt-drawer-backdrop" onClick={() => setDrawerOpen(false)}>
             <div className="felt-drawer-panel" onClick={(e) => e.stopPropagation()}>
               <div className="felt-drawer-head">
-                <strong>Table &amp; Duplicate Records</strong>
+                <strong>Table &amp; Seat Menu</strong>
                 <button type="button" onClick={() => setDrawerOpen(false)}>
                   ✕
                 </button>
@@ -1598,101 +2559,148 @@ export default function App() {
                   </button>
                 </div>
               </div>
+            </div>
+          </div>
+        )}
 
-              <div className="felt-drawer-tabs">
-                <button
-                  type="button"
-                  className={drawerTab === 'scoreboard' ? 'active' : ''}
-                  onClick={() => setDrawerTab('scoreboard')}
-                >
-                  Scores
-                </button>
-                <button
-                  type="button"
-                  className={drawerTab === 'boards' ? 'active' : ''}
-                  onClick={() => setDrawerTab('boards')}
-                >
-                  Boards (1–16)
-                </button>
-                <button
-                  type="button"
-                  className={drawerTab === 'pbn' ? 'active' : ''}
-                  onClick={() => setDrawerTab('pbn')}
-                >
-                  PBN
+        {scoreModalOpen && (
+          <div className="felt-drawer-backdrop" onClick={() => setScoreModalOpen(false)}>
+            <div className="felt-drawer-panel" onClick={(e) => e.stopPropagation()}>
+              <div className="felt-drawer-head">
+                <strong>Table &amp; Duplicate Records</strong>
+                <button type="button" onClick={() => setScoreModalOpen(false)}>
+                  ✕
                 </button>
               </div>
 
-              {drawerTab === 'scoreboard' && (
-                <div>
-                  <div className="felt-totals">
-                    <div>
-                      <span>NS Total</span>
-                      <strong>{cumulativeScore.NS}</strong>
-                    </div>
-                    <div>
-                      <span>EW Total</span>
-                      <strong>{cumulativeScore.EW}</strong>
-                    </div>
-                  </div>
-                  {history.length === 0 ? (
-                    <p className="felt-muted">No completed boards yet.</p>
-                  ) : (
-                    history.map((b) => (
-                      <div key={b.id} className="felt-hist-row">
-                        <span>
-                          #{b.board_number} {b.contract_text || 'Pass'} ({b.declarer || '-'})
-                        </span>
-                        <strong>
-                          NS {b.score_ns} / EW {b.score_ew}
-                        </strong>
-                      </div>
-                    ))
-                  )}
-                </div>
-              )}
+              <div className="scorecard-sheet-wrap">
+                <table className="scorecard-sheet-table">
+                  <thead>
+                    <tr>
+                      <th>Board</th>
+                      <th>Result</th>
+                      <th>We</th>
+                      <th>They</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {history.length === 0 ? (
+                      <tr>
+                        <td colSpan={4} className="scorecard-empty-cell">
+                          No completed boards yet.
+                        </td>
+                      </tr>
+                    ) : (
+                      history.map((b, idx) => {
+                        const info = formatContractAndResult(b);
+                        const isEven = idx % 2 === 1;
+                        return (
+                          <tr
+                            key={b.id}
+                            className={`scorecard-row ${isEven ? 'alt-row' : ''}`}
+                            onClick={() => {
+                              setScoreModalOpen(false);
+                              setHistoryModalBoard(b);
+                              setHistoryViewMode('bidding');
+                              setSelectedTrickIdx(0);
+                              setRevealedCardStep(0);
+                            }}
+                            title="Click to open Board History"
+                          >
+                            <td>{b.board_number}</td>
+                            <td className="scorecard-result-cell">
+                              <span>{info.compactResult}</span>
 
-              {drawerTab === 'boards' && (
-                <div>
-                  <div className="felt-boards-grid">
-                    {Array.from({ length: 16 }, (_, i) => i + 1).map((num) => {
-                      const spec = getBoardBadgeSpec(num);
-                      return (
-                        <button
-                          key={num}
-                          type="button"
-                          className={selectedBoardPreview === num ? 'selected' : ''}
-                          onClick={() => setSelectedBoardPreview(num)}
-                        >
-                          <div>B{num}</div>
-                          <small>
-                            {spec.dealer} · {spec.vul}
-                          </small>
-                        </button>
-                      );
-                    })}
-                  </div>
-                  <div className="felt-board-meta">
-                    Board #{selectedBoardPreview}: Dealer {previewSpec.dealer}, Vul {previewSpec.vul}
-                  </div>
-                </div>
-              )}
-
-              {drawerTab === 'pbn' && (
-                <div>
-                  {history.length === 0 ? (
-                    <p className="felt-muted">No PBN logs yet.</p>
-                  ) : (
-                    history.map((b) => (
-                      <pre key={b.id} className="felt-pbn-pre">
-                        {b.pbn}
-                      </pre>
-                    ))
-                  )}
-                </div>
-              )}
+                            </td>
+                            <td className="scorecard-pts-cell" style={{ textAlign: 'center' }}>
+                              {b.score_ns > 0 ? b.score_ns : ''}
+                            </td>
+                            <td className="scorecard-pts-cell" style={{ textAlign: 'center' }}>
+                              {b.score_ew > 0 ? b.score_ew : ''}
+                            </td>
+                          </tr>
+                        );
+                      })
+                    )}
+                  </tbody>
+                  <tfoot>
+                    <tr className="scorecard-total-row">
+                      <td colSpan={2}>Total</td>
+                      <td className="scorecard-total-yellow" style={{ textAlign: 'center' }}>{cumulativeScore.NS}</td>
+                      <td className="scorecard-total-yellow" style={{ textAlign: 'center' }}>{cumulativeScore.EW}</td>
+                    </tr>
+                  </tfoot>
+                </table>
+              </div>
             </div>
           </div>
+        )}
+        {game && chatOpen && (
+          <section className="room-chat-panel" aria-label="In-room table chat">
+            <div className="room-chat-header">
+              <div className="room-chat-title">
+                <span>Table Chat · {tableId}</span>
+              </div>
+              <button
+                type="button"
+                className="room-chat-close"
+                onClick={() => setChatOpen(false)}
+                title="Minimize chat"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="room-chat-messages">
+              {chatMessages.length === 0 ? (
+                <div className="room-chat-empty">
+                  No messages yet. Say hello to the table!
+                </div>
+              ) : (
+                chatMessages.map((m) => {
+                  const isMine = mySeat && m.seat === mySeat;
+                  const timeStr = new Date(m.timestamp).toLocaleTimeString([], {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                  });
+                  return (
+                    <div
+                      key={m.id}
+                      className={`room-chat-msg ${isMine ? 'mine' : ''}`}
+                    >
+                      <div className="room-chat-meta">
+                        <span className={`room-chat-seat seat-${m.seat.toLowerCase()}`}>
+                          {m.seat}
+                        </span>
+                        <span className="room-chat-sender">{m.senderName}</span>
+                        <span className="room-chat-time">{timeStr}</span>
+                      </div>
+                      <div className="room-chat-bubble">{m.text}</div>
+                    </div>
+                  );
+                })
+              )}
+              <div ref={chatBottomRef} />
+            </div>
+
+            <form className="room-chat-form" onSubmit={sendChatMessage}>
+              <input
+                type="text"
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                placeholder={
+                  mySeat
+                    ? `Message table as ${displayNameForSeat(mySeat)} (${mySeat})...`
+                    : 'Sit at a seat to chat...'
+                }
+                disabled={!mySeat}
+                maxLength={400}
+              />
+              <button type="submit" disabled={!mySeat || !chatInput.trim()}>
+                Send
+              </button>
+            </form>
+          </section>
         )}
       </main>
       {hoveredBidPopover && (

@@ -36,10 +36,19 @@ interface SeatSession {
   playerName: string;
 }
 
+export interface ChatMessage {
+  id: string;
+  seat: Seat | 'SPECTATOR';
+  senderName: string;
+  text: string;
+  timestamp: number;
+}
+
 interface TableRoom {
   id: string;
   seats: Partial<Record<Seat, SeatSession>>;
   game: GameState;
+  chatMessages: ChatMessage[];
 }
 
 const rooms = new Map<string, TableRoom>();
@@ -52,6 +61,7 @@ function getOrCreateRoom(tableId: string): TableRoom {
       id: tableId,
       seats: {},
       game: createNewBoard(1),
+      chatMessages: [],
     };
     rooms.set(tableId, room);
   }
@@ -77,6 +87,10 @@ async function persistCompletedBoard(tableId: string, game: GameState) {
     tricks_ew: game.tricksWon.EW,
     score_ns: game.score?.NS ?? 0,
     score_ew: game.score?.EW ?? 0,
+    tricks_history: game.tricksHistory,
+    initial_hands: game.initialHands,
+    auction: game.auction,
+    accepted_claim: game.acceptedClaim ?? null,
     pbn,
   };
 
@@ -161,6 +175,7 @@ function broadcastRoomState(room: TableRoom) {
       mySeat: viewerSeat,
       playerName: viewerSeat ? room.seats[viewerSeat]?.playerName : undefined,
       seatNames,
+      chatMessages: room.chatMessages,
       game: sanitizeStateForSeat(room.game, viewerSeat),
     });
   }
@@ -204,6 +219,7 @@ io.on('connection', (socket) => {
         mySeat: seat,
         playerName: trimmedName,
         seatNames: getSeatNames(room),
+        chatMessages: room.chatMessages,
         reconnectToken: token,
         game: sanitizeStateForSeat(room.game, seat),
       });
@@ -336,6 +352,36 @@ io.on('connection', (socket) => {
       await persistCompletedBoard(tableId, room.game);
     }
     broadcastRoomState(room);
+  });
+
+  socket.on('send_chat', ({ tableId, text }: { tableId: string; text: string }) => {
+    const room = rooms.get(tableId);
+    if (!room) return;
+    if (typeof text !== 'string') return;
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const clipped = trimmed.slice(0, 400);
+
+    const seat = (['N', 'E', 'S', 'W'] as Seat[]).find((s) => room.seats[s]?.socketId === socket.id);
+    if (!seat) {
+      socket.emit('error_msg', 'Sit at a seat to send chat messages.');
+      return;
+    }
+
+    const msg: ChatMessage = {
+      id: uuidv4(),
+      seat,
+      senderName: room.seats[seat]?.playerName || `Player ${seat}`,
+      text: clipped,
+      timestamp: Date.now(),
+    };
+
+    room.chatMessages.push(msg);
+    if (room.chatMessages.length > 150) {
+      room.chatMessages.splice(0, room.chatMessages.length - 150);
+    }
+
+    io.to(tableId).emit('chat_message', msg);
   });
 
   socket.on('next_board', ({ tableId }: { tableId: string }) => {

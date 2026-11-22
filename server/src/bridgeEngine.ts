@@ -42,6 +42,17 @@ export interface ClaimState {
   rejectedRevealed: boolean;
 }
 
+export interface AcceptedClaimRecord {
+  claimedBy: Seat;
+  claimedDeclarerTricks: number;
+  acceptedBy: Seat[];
+  partialTrick: TrickPlay[];
+  completedTricksCount: number;
+  acceptedAtTrickNumber: number;
+  acceptedAtCardIndex: number;
+  acceptedAtCard: TrickPlay | null;
+}
+
 export interface GameState {
   boardNumber: number;
   dealer: Seat;
@@ -59,6 +70,7 @@ export interface GameState {
   tricksWon: { NS: number; EW: number };
   score: { NS: number; EW: number } | null;
   claim: ClaimState | null;
+  acceptedClaim?: AcceptedClaimRecord | null;
 }
 
 const SEATS: Seat[] = ['N', 'E', 'S', 'W'];
@@ -146,6 +158,7 @@ export function createNewBoard(boardNumber = 1): GameState {
     tricksWon: { NS: 0, EW: 0 },
     score: null,
     claim: null,
+    acceptedClaim: null,
   };
 }
 
@@ -204,7 +217,6 @@ export function applyBid(state: GameState, seat: Seat, call: BidCall): { ok: boo
     return check;
   }
 
-  // Bidders cannot self-alert; strip any extra properties from call
   const cleanCall: BidCall =
     call.type === 'CONTRACT'
       ? { type: 'CONTRACT', level: call.level, strain: call.strain }
@@ -266,7 +278,6 @@ export function applyBid(state: GameState, seat: Seat, call: BidCall): { ok: boo
   state.currentTurn = nextSeat(seat);
   return { ok: true };
 }
-
 
 export function alertPartnerBid(
   state: GameState,
@@ -562,6 +573,38 @@ export function respondToClaim(
     } else {
       state.tricksWon = { NS: finalDefTricks, EW: finalDeclarerTricks };
     }
+    const lastCurrentTrickPlay =
+      state.currentTrick.length > 0 ? state.currentTrick[state.currentTrick.length - 1] : null;
+    const lastCompletedTrick =
+      state.tricksHistory.length > 0 ? state.tricksHistory[state.tricksHistory.length - 1] : null;
+    const lastCompletedPlay =
+      lastCompletedTrick && lastCompletedTrick.cards.length > 0
+        ? lastCompletedTrick.cards[lastCompletedTrick.cards.length - 1]
+        : null;
+    const acceptedAtCard = lastCurrentTrickPlay ? { ...lastCurrentTrickPlay } : lastCompletedPlay ? { ...lastCompletedPlay } : null;
+    const acceptedAtTrickNumber =
+      state.currentTrick.length > 0
+        ? state.tricksHistory.length + 1
+        : Math.max(1, state.tricksHistory.length);
+    const acceptedAtCardIndex =
+      state.currentTrick.length > 0
+        ? state.currentTrick.length
+        : lastCompletedTrick
+        ? lastCompletedTrick.cards.length
+        : 0;
+
+    state.tricksHistory = state.tricksHistory.slice(0, state.tricksHistory.length);
+    state.acceptedClaim = {
+      claimedBy: state.claim.claimedBy,
+      claimedDeclarerTricks: finalDeclarerTricks,
+      acceptedBy: [...state.claim.acceptedBy],
+      partialTrick: [...state.currentTrick],
+      completedTricksCount: state.tricksHistory.length,
+      acceptedAtTrickNumber,
+      acceptedAtCardIndex,
+      acceptedAtCard,
+    };
+    state.currentTrick = [];
     state.phase = 'FINISHED';
     state.score = calculateDuplicateScore(
       state.contract,
@@ -605,6 +648,7 @@ export function sanitizeStateForSeat(state: GameState, viewerSeat: Seat | null) 
     vulnerability: state.vulnerability,
     phase: state.phase,
     hands: maskedHands,
+    initialHands: state.phase === 'FINISHED' ? state.initialHands : undefined,
     auction: state.auction,
     contract: state.contract,
     dummy: state.dummy,
@@ -614,6 +658,7 @@ export function sanitizeStateForSeat(state: GameState, viewerSeat: Seat | null) 
     tricksWon: state.tricksWon,
     score: state.score,
     claim: state.claim,
+    acceptedClaim: state.acceptedClaim ?? null,
   };
 }
 

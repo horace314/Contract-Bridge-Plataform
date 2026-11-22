@@ -4,6 +4,7 @@ import { io, Socket } from 'socket.io-client';
 type Seat = 'N' | 'E' | 'S' | 'W';
 type Suit = 'C' | 'D' | 'H' | 'S';
 type Strain = Suit | 'NT';
+type SpectatorHandMode = 'ALL_HANDS' | 'DUMMY_AND_REVEALED';
 
 interface Card {
   suit: Suit;
@@ -81,6 +82,8 @@ interface RoomSummary {
   boardNumber: number;
   phase: string;
   occupiedCount: number;
+  spectatorCount?: number;
+  botSeats?: Seat[];
   seats: Partial<Record<Seat, string>>;
 }
 
@@ -661,6 +664,8 @@ export default function App() {
   const [newRoomSeat, setNewRoomSeat] = useState<Seat>('S');
   const [fillOpenSeatsWithBots, setFillOpenSeatsWithBots] = useState(false);
   const [botSeats, setBotSeats] = useState<Seat[]>([]);
+  const [spectatorHandMode, setSpectatorHandMode] =
+    useState<SpectatorHandMode>('ALL_HANDS');
   const [availableRooms, setAvailableRooms] = useState<RoomSummary[]>([]);
   const [viewportWidth, setViewportWidth] = useState<number>(() =>
     typeof window !== 'undefined' ? window.innerWidth : 1200
@@ -813,6 +818,7 @@ export default function App() {
   });
   const [seatNames, setSeatNames] = useState<Partial<Record<Seat, string>>>({});
   const [mySeat, setMySeat] = useState<Seat | null>(null);
+  const [isSpectator, setIsSpectator] = useState(false);
   const [game, setGame] = useState<GameState | null>(null);
   const [displayedTrick, setDisplayedTrick] = useState<{ seat: Seat; card: Card }[]>([]);
   const [selectedBidLevel, setSelectedBidLevel] = useState<number | null>(null);
@@ -945,26 +951,38 @@ export default function App() {
 
     s.on('table_state', (payload) => {
       const activeRoomId = payload.tableId || tableIdRef.current;
+      const nextSeat: Seat | null = payload.mySeat ?? null;
+      const nextSpectator = Boolean(
+        payload.isSpectator || payload.role === 'SPECTATOR' || nextSeat === null
+      );
+
       if (payload.tableId && payload.tableId !== tableIdRef.current) {
         setTableId(payload.tableId);
       }
-      if (payload.reconnectToken && payload.mySeat) {
-        localStorage.setItem(`bridge_token_${activeRoomId}_${payload.mySeat}`, payload.reconnectToken);
+      if (payload.reconnectToken && nextSeat && !nextSpectator) {
+        localStorage.setItem(`bridge_token_${activeRoomId}_${nextSeat}`, payload.reconnectToken);
       }
       if (payload.seatNames) {
         setSeatNames(payload.seatNames);
       }
       if (Array.isArray(payload.botSeats)) {
-        setBotSeats(payload.botSeats.filter((s: unknown): s is Seat => SEATS.includes(s as Seat)));
+        setBotSeats(payload.botSeats.filter((seat: unknown): seat is Seat => SEATS.includes(seat as Seat)));
+      }
+      if (
+        payload.spectatorHandMode === 'ALL_HANDS' ||
+        payload.spectatorHandMode === 'DUMMY_AND_REVEALED'
+      ) {
+        setSpectatorHandMode(payload.spectatorHandMode);
       }
       if (Array.isArray(payload.chatMessages)) {
         setChatMessages(payload.chatMessages);
       }
-      if (payload.playerName && payload.mySeat) {
+      if (payload.playerName && nextSeat && !nextSpectator) {
         setPlayerNameInput(payload.playerName);
         localStorage.setItem('bridge_player_name', payload.playerName);
       }
-      setMySeat(payload.mySeat);
+      setMySeat(nextSeat);
+      setIsSpectator(nextSpectator);
       const nextGame: GameState = payload.game;
       setGame(nextGame);
 
@@ -1027,8 +1045,10 @@ export default function App() {
     s.on('left_table', () => {
       setGame(null);
       setMySeat(null);
+      setIsSpectator(false);
       setSeatNames({});
       setBotSeats([]);
+      setSpectatorHandMode('ALL_HANDS');
       setDisplayedTrick([]);
       setSelectedBidLevel(null);
       setExplainingBidIndex(null);
@@ -1204,6 +1224,7 @@ export default function App() {
     socket.emit('join_table', {
       tableId: chosenRoom,
       seat,
+      spectator: false,
       playerName: trimmedName,
       password: effectivePassword || undefined,
       reconnectToken,
@@ -1211,6 +1232,75 @@ export default function App() {
     });
     setDrawerOpen(false);
     setTimeout(() => loadRooms(), 150);
+  };
+
+  const joinSpectator = (targetRoomId?: string, passwordOverride?: string) => {
+    if (!socket) return;
+    const chosenRoom = (targetRoomId ?? tableId).trim();
+    if (!chosenRoom) return;
+    if (chosenRoom !== tableId) {
+      setTableId(chosenRoom);
+    }
+    const trimmedName = playerNameInput.trim() || 'Spectator';
+    const effectivePassword =
+      passwordOverride !== undefined ? passwordOverride.trim() : roomPasswordInput.trim();
+    socket.emit('join_table', {
+      tableId: chosenRoom,
+      seat: 'SPECTATOR',
+      spectator: true,
+      spectatorHandMode,
+      playerName: trimmedName,
+      password: effectivePassword || undefined,
+    });
+    setDrawerOpen(false);
+    setTimeout(() => loadRooms(), 150);
+  };
+
+  const updateSpectatorHandMode = (nextMode: SpectatorHandMode) => {
+    setSpectatorHandMode(nextMode);
+    if (socket?.connected && tableId.trim()) {
+      socket.emit('set_spectator_view', {
+        tableId: tableId.trim(),
+        mode: nextMode,
+      });
+    }
+  };
+
+  const createFourBotRoom = (targetRoomId?: string, passwordOverride?: string) => {
+    if (!socket) return;
+    const chosenRoom = (targetRoomId ?? newRoomName).trim();
+    if (!chosenRoom) return;
+    setTableId(chosenRoom);
+    const effectivePassword =
+      passwordOverride !== undefined ? passwordOverride.trim() : newRoomPassword.trim();
+    const botLabels: Record<Seat, string> = {
+      N: 'Bot North',
+      E: 'Bot East',
+      S: 'Bot South',
+      W: 'Bot West',
+    };
+    socket.emit('join_table', {
+      tableId: chosenRoom,
+      seat: 'SPECTATOR',
+      spectator: true,
+      spectatorHandMode,
+      playerName: playerNameInput.trim() || 'Spectator',
+      password: effectivePassword || undefined,
+      fillBots: true,
+    });
+    SEATS.forEach((s) => {
+      socket.emit('add_bot', {
+        tableId: chosenRoom,
+        seat: s,
+        botName: botLabels[s],
+      });
+    });
+    socket.emit('fill_bots', {
+      tableId: chosenRoom,
+      seats: SEATS,
+    });
+    setDrawerOpen(false);
+    setTimeout(() => loadRooms(), 200);
   };
 
   const addBotToSeat = (seat: Seat) => {
@@ -1236,6 +1326,13 @@ export default function App() {
     const openSeats = SEATS.filter((s) => !seatNames[s] && !botSeats.includes(s));
     if (openSeats.length === 0) return;
     if (socket?.connected) {
+      openSeats.forEach((s) => {
+        socket.emit('add_bot', {
+          tableId: activeRoom,
+          seat: s,
+          botName: `Bot ${SEAT_FULL_NAME[s]}`,
+        });
+      });
       socket.emit('fill_bots', {
         tableId: activeRoom,
         seats: openSeats,
@@ -1262,6 +1359,7 @@ export default function App() {
     }
     setGame(null);
     setMySeat(null);
+    setIsSpectator(false);
     setSeatNames({});
     setDisplayedTrick([]);
     setSelectedBidLevel(null);
@@ -1315,25 +1413,29 @@ export default function App() {
   };
 
   const sendBid = (call: BidCall) => {
+    if (isSpectator || !mySeat) return;
     socket?.emit('make_bid', { tableId, call });
     setSelectedBidLevel(null);
   };
 
   const alertPartnerBidCall = (bidIndex: number) => {
+    if (isSpectator || !mySeat) return;
     socket?.emit('alert_bid', { tableId, bidIndex });
   };
 
   const askForExplanation = (bidIndex: number) => {
+    if (isSpectator || !mySeat) return;
     socket?.emit('request_explanation', { tableId, bidIndex });
   };
 
   const openPartnerExplainModal = (bidIndex: number, existingExplanation?: string) => {
+    if (isSpectator || !mySeat) return;
     setExplainingBidIndex(bidIndex);
     setExplanationInput(existingExplanation || '');
   };
 
   const submitPartnerExplanation = (alsoAlert: boolean) => {
-    if (explainingBidIndex === null) return;
+    if (explainingBidIndex === null || isSpectator || !mySeat) return;
     if (alsoAlert) {
       socket?.emit('alert_bid', {
         tableId,
@@ -1352,21 +1454,25 @@ export default function App() {
   };
 
   const sendCard = (card: Card, actingSeat?: Seat) => {
+    if (isSpectator || !mySeat) return;
     const resolvedSeat = actingSeat || activeHandSeat || mySeat || undefined;
     socket?.emit('play_card', { tableId, card, seat: resolvedSeat });
   };
 
   const submitClaim = () => {
+    if (isSpectator || !mySeat) return;
     socket?.emit('claim_tricks', { tableId, claimedTricks: claimTricksInput });
     setClaimModalOpen(false);
   };
 
   const respondClaim = (accept: boolean) => {
+    if (isSpectator || !mySeat) return;
     socket?.emit('respond_claim', { tableId, accept });
   };
 
   const sendChatMessage = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
+    if (isSpectator || !mySeat) return;
     const trimmed = chatInput.trim();
     if (!trimmed || !socket) return;
     socket.emit('send_chat', { tableId, text: trimmed });
@@ -1381,6 +1487,7 @@ export default function App() {
   const isMyTurn = Boolean(
     game &&
       mySeat &&
+      !isSpectator &&
       !(game.claim && !game.claim.rejectedRevealed) &&
       (game.currentTurn === mySeat ||
         (game.phase === 'PLAYING' &&
@@ -1389,7 +1496,7 @@ export default function App() {
   );
 
   const activeHandSeat: Seat | null =
-    game && mySeat
+    game && mySeat && !isSpectator
       ? game.phase === 'PLAYING' &&
         game.currentTurn === game.dummy &&
         game.contract?.declarer === mySeat
@@ -1397,10 +1504,10 @@ export default function App() {
         : mySeat
       : null;
 
-  const isDeclarer = Boolean(game && mySeat && game.contract?.declarer === mySeat);
+  const isDeclarer = Boolean(game && mySeat && !isSpectator && game.contract?.declarer === mySeat);
   const declarerSide = game?.contract ? sideOf(game.contract.declarer) : null;
   const isDefender = Boolean(
-    game && mySeat && declarerSide && sideOf(mySeat) !== declarerSide
+    game && mySeat && !isSpectator && declarerSide && sideOf(mySeat) !== declarerSide
   );
   const canDeclarerClaim = Boolean(
     game?.phase === 'PLAYING' &&
@@ -1433,6 +1540,7 @@ export default function App() {
   const isDeclarerOrDummyViewer = Boolean(
     game &&
       mySeat &&
+      !isSpectator &&
       (game.contract?.declarer === mySeat || game.dummy === mySeat)
   );
 
@@ -1458,6 +1566,7 @@ export default function App() {
 
   const contractSuitOrder = getSuitOrderForContract(game?.contract?.strain);
   const bottomCards = sortCardsBySuitOrder(game?.hands[bottomSeat] || [], contractSuitOrder);
+  const bottomIsFaceUp = bottomCards.some((c) => c.rank > 0);
   const isClaimRevealed = Boolean(
     game?.claim || game?.acceptedClaim || game?.phase === 'FINISHED'
   );
@@ -1526,13 +1635,14 @@ export default function App() {
 
   const displayNameForSeat = (seat: Seat) => {
     if (seatNames[seat]) return seatNames[seat]!;
-    if (mySeat === seat && playerNameInput.trim()) return playerNameInput.trim();
+    if (botSeats.includes(seat)) return `Bot ${SEAT_FULL_NAME[seat]}`;
+    if (mySeat === seat && !isSpectator && playerNameInput.trim()) return playerNameInput.trim();
     return `${SEAT_FULL_NAME[seat]} Seat`;
   };
 
   const formatSeatLabel = (seat: Seat) => {
     const nm = displayNameForSeat(seat);
-    if (mySeat === seat) return `${nm} (You)`;
+    if (mySeat === seat && !isSpectator) return `${nm} (You)`;
     if (game?.dummy === seat) return `${nm} · Dummy`;
     return nm;
   };
@@ -1542,7 +1652,7 @@ export default function App() {
     : '';
 
   const auctionStatus =
-    game && mySeat
+    game && mySeat && !isSpectator
       ? getAuctionLegalStatus(game.auction, mySeat)
       : {
           lastContract: null,
@@ -1574,7 +1684,7 @@ export default function App() {
   }
 
   const pendingPartnerExplainRequests: { entry: AuctionEntry; bidIndex: number }[] =
-    game && mySeat
+    game && mySeat && !isSpectator
       ? game.auction
           .map((entry, bidIndex) => ({ entry, bidIndex }))
           .filter(
@@ -1607,8 +1717,8 @@ export default function App() {
     if (!cell) return null;
     const { entry, bidIndex } = cell;
     const hoverId = `${scopeKey}-${bidIndex}`;
-    const isPartner = Boolean(mySeat && partnerSeat(entry.seat) === mySeat);
-    const isOpponent = Boolean(mySeat && sideOf(entry.seat) !== sideOf(mySeat));
+    const isPartner = Boolean(mySeat && !isSpectator && partnerSeat(entry.seat) === mySeat);
+    const isOpponent = Boolean(mySeat && !isSpectator && sideOf(entry.seat) !== sideOf(mySeat));
     const hasRequested = Boolean(mySeat && entry.explanationRequestedBy?.includes(mySeat));
     const anyOpponentAsked = (entry.explanationRequestedBy?.length || 0) > 0;
     const hasExplanation = Boolean(entry.explanation);
@@ -1838,7 +1948,7 @@ export default function App() {
   const vulClass = `vul-${(game?.vulnerability || 'NONE').toLowerCase()}`;
 
   const renderSeatKickButton = (seat: Seat) => {
-    if (!seatNames[seat] || mySeat === seat) return null;
+    if (isSpectator || !seatNames[seat] || mySeat === seat) return null;
     return (
       <button
         type="button"
@@ -2105,7 +2215,7 @@ export default function App() {
               type="button"
               className={`rail-chat-btn ${chatOpen ? 'active' : ''}`}
               onClick={() => setChatOpen((prev) => !prev)}
-              title="Table Chat (visible to all 4 players)"
+              title="Table Chat"
             >
               <span>Chat</span>
               {unreadChatCount > 0 && (
@@ -2477,6 +2587,8 @@ export default function App() {
                                   display: 'flex',
                                   justifyContent: 'space-between',
                                   alignItems: 'center',
+                                  gap: 8,
+                                  flexWrap: 'wrap',
                                   marginBottom: 6,
                                 }}
                               >
@@ -2505,15 +2617,41 @@ export default function App() {
                                     </span>
                                   )}
                                 </div>
-                                <span
-                                  style={{
-                                    fontSize: 12,
-                                    fontVariantNumeric: 'tabular-nums',
-                                    color: '#475569',
-                                  }}
-                                >
-                                  Board #{r.boardNumber} · {r.occupiedCount}/4 seated
-                                </span>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                  <span
+                                    style={{
+                                      fontSize: 12,
+                                      fontVariantNumeric: 'tabular-nums',
+                                      color: '#475569',
+                                    }}
+                                  >
+                                    Board #{r.boardNumber} · {r.occupiedCount}/4 seated
+                                    {typeof r.spectatorCount === 'number'
+                                      ? ` · ${r.spectatorCount} watching`
+                                      : ''}
+                                  </span>
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setTableId(r.id);
+                                      joinSpectator(r.id);
+                                    }}
+                                    style={{
+                                      fontFamily: UI_FONT_FAMILY,
+                                      fontSize: 11.5,
+                                      fontWeight: 600,
+                                      padding: '3px 8px',
+                                      borderRadius: 5,
+                                      border: '1px solid #94a3b8',
+                                      background: '#f8fafc',
+                                      color: '#0f172a',
+                                      cursor: 'pointer',
+                                    }}
+                                  >
+                                    Spectate
+                                  </button>
+                                </div>
                               </div>
 
                               <div
@@ -2655,6 +2793,27 @@ export default function App() {
                             onClick={() => {
                               const targetId = tableId || availableRooms[0]?.id;
                               if (!targetId) return;
+                              joinSpectator(targetId);
+                            }}
+                            style={{
+                              padding: '8px 12px',
+                              borderRadius: 7,
+                              fontFamily: UI_FONT_FAMILY,
+                              fontSize: 13,
+                              fontWeight: 600,
+                              border: '1px solid #94a3b8',
+                              background: '#ffffff',
+                              color: '#0f172a',
+                              cursor: 'pointer',
+                            }}
+                          >
+                            Watch as Spectator
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const targetId = tableId || availableRooms[0]?.id;
+                              if (!targetId) return;
                               joinSeat(selectedSeat, targetId);
                             }}
                             style={{
@@ -2703,7 +2862,7 @@ export default function App() {
                       Create a Casual Room
                     </strong>
                     <div style={{ fontSize: 12.5, lineHeight: 1.45, color: '#475569' }}>
-                      Start a casual table with optional password protection.
+                      Start a casual table with optional password protection or 4 AI bots.
                     </div>
                     <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                       <input
@@ -2805,32 +2964,59 @@ export default function App() {
                     </label>
                   </div>
 
-                  <button
-                    type="button"
-                    disabled={!newRoomName.trim()}
-                    style={{
-                      width: '100%',
-                      padding: '9px 14px',
-                      borderRadius: 7,
-                      fontFamily: UI_FONT_FAMILY,
-                      border: newRoomName.trim() ? '1px solid #ca8a04' : '1px solid #cbd5e1',
-                      fontWeight: 700,
-                      fontSize: 13.5,
-                      background: newRoomName.trim() ? '#facc15' : '#e2e8f0',
-                      color: newRoomName.trim() ? '#0f172a' : '#64748b',
-                      cursor: newRoomName.trim() ? 'pointer' : 'not-allowed',
-                    }}
-                    onClick={() => {
-                      const createdId = newRoomName.trim();
-                      if (!createdId) return;
-                      setTableId(createdId);
-                      setSelectedSeat(newRoomSeat);
-                      setRoomPasswordInput(newRoomPassword);
-                      joinSeat(newRoomSeat, createdId, newRoomPassword, fillOpenSeatsWithBots);
-                    }}
-                  >
-                    Create &amp; Sit
-                  </button>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      disabled={!newRoomName.trim()}
+                      style={{
+                        flex: '1 1 160px',
+                        padding: '9px 14px',
+                        borderRadius: 7,
+                        fontFamily: UI_FONT_FAMILY,
+                        border: newRoomName.trim() ? '1px solid #ca8a04' : '1px solid #cbd5e1',
+                        fontWeight: 700,
+                        fontSize: 13.5,
+                        background: newRoomName.trim() ? '#facc15' : '#e2e8f0',
+                        color: newRoomName.trim() ? '#0f172a' : '#64748b',
+                        cursor: newRoomName.trim() ? 'pointer' : 'not-allowed',
+                      }}
+                      onClick={() => {
+                        const createdId = newRoomName.trim();
+                        if (!createdId) return;
+                        setTableId(createdId);
+                        setSelectedSeat(newRoomSeat);
+                        setRoomPasswordInput(newRoomPassword);
+                        joinSeat(newRoomSeat, createdId, newRoomPassword, fillOpenSeatsWithBots);
+                      }}
+                    >
+                      Create &amp; Sit
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={!newRoomName.trim()}
+                      style={{
+                        flex: '1 1 160px',
+                        padding: '9px 14px',
+                        borderRadius: 7,
+                        fontFamily: UI_FONT_FAMILY,
+                        border: newRoomName.trim() ? '1px solid #0f766e' : '1px solid #cbd5e1',
+                        fontWeight: 700,
+                        fontSize: 13.5,
+                        background: newRoomName.trim() ? '#0f766e' : '#e2e8f0',
+                        color: newRoomName.trim() ? '#ffffff' : '#64748b',
+                        cursor: newRoomName.trim() ? 'pointer' : 'not-allowed',
+                      }}
+                      onClick={() => {
+                        const createdId = newRoomName.trim();
+                        if (!createdId) return;
+                        setRoomPasswordInput(newRoomPassword);
+                        createFourBotRoom(createdId, newRoomPassword);
+                      }}
+                    >
+                      Create 4-Bot Table (Spectate)
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -2990,7 +3176,11 @@ export default function App() {
                         </button>
                       </div>
                     ) : (
-                      <div className="claim-waiting-text">Waiting for defenders to respond...</div>
+                      <div className="claim-waiting-text">
+                        {isSpectator
+                          ? 'Spectating claim decision...'
+                          : 'Waiting for defenders to respond...'}
+                      </div>
                     )}
                   </div>
                 )}
@@ -3068,7 +3258,7 @@ export default function App() {
                   </div>
                 )}
 
-                {game.phase === 'BIDDING' && mySeat && game.currentTurn === mySeat && (
+                {game.phase === 'BIDDING' && mySeat && !isSpectator && game.currentTurn === mySeat && (
                   <div className="felt-bidding-panel">
                     <div className="felt-bid-bar">
                       <button
@@ -3224,6 +3414,10 @@ export default function App() {
                     suitOrder={contractSuitOrder}
                   />
                 </div>
+              ) : !bottomIsFaceUp && !isClaimRevealed ? (
+                <div style={{ display: 'flex', justifyContent: 'center', marginBottom: 6 }}>
+                  <FanCardBack orientation="top" count={bottomCards.length || 13} />
+                </div>
               ) : (
                 <div
                   className="felt-strip-row bottom-hand-strip"
@@ -3243,11 +3437,12 @@ export default function App() {
                       key={`${c.suit}-${c.rank}-${idx}`}
                       card={c}
                       disabled={
+                        isSpectator ||
                         c.rank === 0 ||
                         !(game.phase === 'PLAYING' && isMyTurn && activeHandSeat === bottomSeat)
                       }
                       onClick={() => sendCard(c, bottomSeat)}
-                      highlighted={game.currentTurn === bottomSeat}
+                      highlighted={!isSpectator && game.currentTurn === bottomSeat}
                       rankFontSize={isWideScreen ? `${wideRankFontRem}rem` : undefined}
                       pipFontSize={isWideScreen ? `${widePipFontRem}rem` : undefined}
                       style={
@@ -3273,14 +3468,18 @@ export default function App() {
                 }`}
               >
                 <div className="felt-bottom-left">
-                  <span className="felt-seat-tag">{bottomSeat}</span>
+                  <span className="felt-seat-tag">{isSpectator ? '👁' : bottomSeat}</span>
                   <span className={`felt-player-icon ${isMyTurn ? 'turn-yellow' : ''}`}>
                     ♛
                   </span>
                   <span className="felt-bottom-user">
-                    {mySeat
+                    {mySeat && !isSpectator
                       ? `${displayNameForSeat(bottomSeat)} · ${tableId}`
-                      : 'Spectator'}
+                      : `Spectator (${
+                          spectatorHandMode === 'ALL_HANDS'
+                            ? 'All 4 Hands'
+                            : 'Dummy & Revealed'
+                        }) · ${tableId}`}
                   </span>
                 </div>
               </div>
@@ -3288,7 +3487,7 @@ export default function App() {
           </>
         )}
 
-        {pendingPartnerExplainRequests.length > 0 && game && (
+        {pendingPartnerExplainRequests.length > 0 && game && !isSpectator && (
           <div className="partner-explain-banner">
             <span>
               Opponents asked you to explain partner&apos;s{' '}
@@ -3312,7 +3511,7 @@ export default function App() {
           </div>
         )}
 
-        {explainingBidIndex !== null && game && game.auction[explainingBidIndex] && (
+        {explainingBidIndex !== null && game && !isSpectator && game.auction[explainingBidIndex] && (
           <div className="felt-drawer-backdrop" onClick={() => setExplainingBidIndex(null)}>
             <div className="felt-claim-modal" onClick={(e) => e.stopPropagation()}>
               <h3>
@@ -3360,7 +3559,7 @@ export default function App() {
           </div>
         )}
 
-        {claimModalOpen && game && (
+        {claimModalOpen && game && !isSpectator && (
           <div className="felt-drawer-backdrop" onClick={() => setClaimModalOpen(false)}>
             <div className="felt-claim-modal" onClick={(e) => e.stopPropagation()}>
               <h3>Claim Tricks</h3>
@@ -3786,6 +3985,72 @@ export default function App() {
                   className="felt-drawer-name-input"
                 />
 
+                {isSpectator && (
+                  <div
+                    style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 6,
+                      marginTop: 8,
+                      padding: 8,
+                      borderRadius: 8,
+                      background: 'rgba(0, 0, 0, 0.25)',
+                      border: '1px solid rgba(255, 255, 255, 0.14)',
+                    }}
+                  >
+                    <div style={{ fontSize: 12, fontWeight: 600 }}>Spectator Hand Visibility</div>
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      <button
+                        type="button"
+                        onClick={() => updateSpectatorHandMode('ALL_HANDS')}
+                        style={{
+                          flex: 1,
+                          padding: '5px 8px',
+                          borderRadius: 6,
+                          border:
+                            spectatorHandMode === 'ALL_HANDS'
+                              ? '1.5px solid #facc15'
+                              : '1px solid rgba(255, 255, 255, 0.2)',
+                          background:
+                            spectatorHandMode === 'ALL_HANDS'
+                              ? 'rgba(250, 204, 21, 0.2)'
+                              : 'rgba(255, 255, 255, 0.06)',
+                          color: spectatorHandMode === 'ALL_HANDS' ? '#fef08a' : '#f8fafc',
+                          fontSize: 11.5,
+                          fontWeight: spectatorHandMode === 'ALL_HANDS' ? 700 : 500,
+                          cursor: 'pointer',
+                        }}
+                      >
+                        All 4 Hands
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => updateSpectatorHandMode('DUMMY_AND_REVEALED')}
+                        style={{
+                          flex: 1,
+                          padding: '5px 8px',
+                          borderRadius: 6,
+                          border:
+                            spectatorHandMode === 'DUMMY_AND_REVEALED'
+                              ? '1.5px solid #facc15'
+                              : '1px solid rgba(255, 255, 255, 0.2)',
+                          background:
+                            spectatorHandMode === 'DUMMY_AND_REVEALED'
+                              ? 'rgba(250, 204, 21, 0.2)'
+                              : 'rgba(255, 255, 255, 0.06)',
+                          color:
+                            spectatorHandMode === 'DUMMY_AND_REVEALED' ? '#fef08a' : '#f8fafc',
+                          fontSize: 11.5,
+                          fontWeight: spectatorHandMode === 'DUMMY_AND_REVEALED' ? 700 : 500,
+                          cursor: 'pointer',
+                        }}
+                      >
+                        Dummy &amp; Revealed
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 {game && (
                   <div
                     style={{
@@ -3832,7 +4097,7 @@ export default function App() {
                     {SEATS.map((s) => {
                       const isBotSeat = botSeats.includes(s);
                       const occupant = seatNames[s] || (isBotSeat ? `Bot ${SEAT_FULL_NAME[s]}` : undefined);
-                      const isSelfSeat = mySeat === s;
+                      const isSelfSeat = !isSpectator && mySeat === s;
                       return (
                         <div
                           key={s}
@@ -3875,22 +4140,24 @@ export default function App() {
                             )}
                           </span>
                           {occupant ? (
-                            <button
-                              type="button"
-                              onClick={() => removeSeatOccupant(s)}
-                              style={{
-                                padding: '3px 8px',
-                                borderRadius: 5,
-                                border: '1px solid rgba(248, 113, 113, 0.55)',
-                                background: 'rgba(185, 28, 28, 0.78)',
-                                color: '#fff',
-                                fontSize: 11,
-                                fontWeight: 600,
-                                cursor: 'pointer',
-                              }}
-                            >
-                              {isSelfSeat ? 'Leave Seat' : isBotSeat ? 'Remove Bot' : 'Remove'}
-                            </button>
+                            !isSpectator ? (
+                              <button
+                                type="button"
+                                onClick={() => removeSeatOccupant(s)}
+                                style={{
+                                  padding: '3px 8px',
+                                  borderRadius: 5,
+                                  border: '1px solid rgba(248, 113, 113, 0.55)',
+                                  background: 'rgba(185, 28, 28, 0.78)',
+                                  color: '#fff',
+                                  fontSize: 11,
+                                  fontWeight: 600,
+                                  cursor: 'pointer',
+                                }}
+                              >
+                                {isSelfSeat ? 'Leave Seat' : isBotSeat ? 'Remove Bot' : 'Remove'}
+                              </button>
+                            ) : null
                           ) : (
                             <button
                               type="button"
@@ -4266,7 +4533,7 @@ export default function App() {
                 </div>
               ) : (
                 chatMessages.map((m) => {
-                  const isMine = mySeat && m.seat === mySeat;
+                  const isMine = !isSpectator && mySeat && m.seat === mySeat;
                   const timeStr = new Date(m.timestamp).toLocaleTimeString([], {
                     hour: '2-digit',
                     minute: '2-digit',
@@ -4297,14 +4564,14 @@ export default function App() {
                 value={chatInput}
                 onChange={(e) => setChatInput(e.target.value)}
                 placeholder={
-                  mySeat
+                  mySeat && !isSpectator
                     ? `Message table as ${displayNameForSeat(mySeat)} (${mySeat})...`
-                    : 'Sit at a seat to chat...'
+                    : 'Spectating (chat disabled for spectators)...'
                 }
-                disabled={!mySeat}
+                disabled={!mySeat || isSpectator}
                 maxLength={400}
               />
-              <button type="submit" disabled={!mySeat || !chatInput.trim()}>
+              <button type="submit" disabled={!mySeat || isSpectator || !chatInput.trim()}>
                 Send
               </button>
             </form>

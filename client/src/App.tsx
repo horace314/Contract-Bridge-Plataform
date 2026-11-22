@@ -14,7 +14,15 @@ type BidCall =
   | { type: 'PASS' }
   | { type: 'DOUBLE' }
   | { type: 'REDOUBLE' }
-  | { type: 'CONTRACT'; level: number; strain: Strain; alert?: string };
+  | { type: 'CONTRACT'; level: number; strain: Strain };
+
+interface AuctionEntry {
+  seat: Seat;
+  call: BidCall;
+  alerted?: boolean;
+  explanation?: string;
+  explanationRequestedBy?: Seat[];
+}
 
 interface ClaimState {
   claimedBy: Seat;
@@ -30,7 +38,7 @@ interface GameState {
   vulnerability: 'NONE' | 'NS' | 'EW' | 'BOTH';
   phase: 'WAITING' | 'BIDDING' | 'PLAYING' | 'FINISHED';
   hands: Partial<Record<Seat, Card[]>>;
-  auction: { seat: Seat; call: BidCall }[];
+  auction: AuctionEntry[];
   contract: { level: number; strain: Strain; declarer: Seat; doubled: 0 | 1 | 2 } | null;
   dummy: Seat | null;
   currentTurn: Seat;
@@ -73,6 +81,10 @@ function rankLabel(rank: number): string {
 
 function sideOf(seat: Seat): 'NS' | 'EW' {
   return seat === 'N' || seat === 'S' ? 'NS' : 'EW';
+}
+
+function partnerSeat(seat: Seat): Seat {
+  return SEATS[(SEATS.indexOf(seat) + 2) % 4];
 }
 
 function isRedStrain(strain: Strain): boolean {
@@ -221,7 +233,6 @@ function renderColoredBidCall(call: BidCall) {
     <span className="bid-text-black">
       {call.level}
       <span className={red ? 'suit-red' : 'suit-black'}>{SUIT_SYM[call.strain]}</span>
-      {call.alert ? <small> ({call.alert})</small> : null}
     </span>
   );
 }
@@ -413,8 +424,17 @@ export default function App() {
   const [mySeat, setMySeat] = useState<Seat | null>(null);
   const [game, setGame] = useState<GameState | null>(null);
   const [displayedTrick, setDisplayedTrick] = useState<{ seat: Seat; card: Card }[]>([]);
-  const [alertText, setAlertText] = useState('');
   const [selectedBidLevel, setSelectedBidLevel] = useState<number | null>(null);
+  const [explainingBidIndex, setExplainingBidIndex] = useState<number | null>(null);
+  const [explanationInput, setExplanationInput] = useState('');
+  const [hoveredBidPopover, setHoveredBidPopover] = useState<{
+    key: string;
+    partnerName: string;
+    partnerSeat: Seat;
+    explanation: string;
+    top: number;
+    left: number;
+  } | null>(null);
   const [errorMsg, setErrorMsg] = useState('');
   const [history, setHistory] = useState<CompletedBoardRecord[]>([]);
   const [selectedBoardPreview, setSelectedBoardPreview] = useState<number>(1);
@@ -571,8 +591,39 @@ export default function App() {
 
   const sendBid = (call: BidCall) => {
     socket?.emit('make_bid', { tableId, call });
-    setAlertText('');
     setSelectedBidLevel(null);
+  };
+
+  const alertPartnerBidCall = (bidIndex: number) => {
+    socket?.emit('alert_bid', { tableId, bidIndex });
+  };
+
+  const askForExplanation = (bidIndex: number) => {
+    socket?.emit('request_explanation', { tableId, bidIndex });
+  };
+
+  const openPartnerExplainModal = (bidIndex: number, existingExplanation?: string) => {
+    setExplainingBidIndex(bidIndex);
+    setExplanationInput(existingExplanation || '');
+  };
+
+  const submitPartnerExplanation = (alsoAlert: boolean) => {
+    if (explainingBidIndex === null) return;
+    if (alsoAlert) {
+      socket?.emit('alert_bid', {
+        tableId,
+        bidIndex: explainingBidIndex,
+        explanation: explanationInput.trim() || undefined,
+      });
+    } else {
+      socket?.emit('explain_bid', {
+        tableId,
+        bidIndex: explainingBidIndex,
+        explanation: explanationInput.trim(),
+      });
+    }
+    setExplainingBidIndex(null);
+    setExplanationInput('');
   };
 
   const sendCard = (card: Card) => {
@@ -690,14 +741,19 @@ export default function App() {
           isStrainLegal: () => false,
         };
 
+  interface AuctionCellItem {
+    entry: AuctionEntry;
+    bidIndex: number;
+  }
+
   const auctionCols: Seat[] = ['W', 'N', 'E', 'S'];
-  const auctionRows: ({ seat: Seat; call: BidCall } | null)[][] = [];
+  const auctionRows: (AuctionCellItem | null)[][] = [];
   if (game) {
     const startIdx = auctionCols.indexOf(game.dealer);
-    const flat: ({ seat: Seat; call: BidCall } | null)[] = Array(startIdx).fill(null);
-    for (const entry of game.auction) {
-      flat.push(entry);
-    }
+    const flat: (AuctionCellItem | null)[] = Array(startIdx).fill(null);
+    game.auction.forEach((entry, bidIndex) => {
+      flat.push({ entry, bidIndex });
+    });
     while (flat.length % 4 !== 0) {
       flat.push(null);
     }
@@ -705,6 +761,148 @@ export default function App() {
       auctionRows.push(flat.slice(i, i + 4));
     }
   }
+
+  const pendingPartnerExplainRequests: { entry: AuctionEntry; bidIndex: number }[] =
+    game && mySeat
+      ? game.auction
+          .map((entry, bidIndex) => ({ entry, bidIndex }))
+          .filter(
+            ({ entry }) =>
+              partnerSeat(entry.seat) === mySeat &&
+              (entry.explanationRequestedBy?.length || 0) > 0 &&
+              !entry.explanation
+          )
+      : [];
+
+  const openBidHoverPopover = (
+    el: HTMLElement,
+    key: string,
+    bidderSeat: Seat,
+    explanation: string
+  ) => {
+    const rect = el.getBoundingClientRect();
+    const pSeat = partnerSeat(bidderSeat);
+    setHoveredBidPopover({
+      key,
+      partnerName: displayNameForSeat(pSeat),
+      partnerSeat: pSeat,
+      explanation,
+      top: rect.top,
+      left: rect.left + rect.width / 2,
+    });
+  };
+
+  const renderAuctionCellContent = (cell: AuctionCellItem | null, scopeKey: string) => {
+    if (!cell) return null;
+    const { entry, bidIndex } = cell;
+    const hoverId = `${scopeKey}-${bidIndex}`;
+    const isPartner = Boolean(mySeat && partnerSeat(entry.seat) === mySeat);
+    const isOpponent = Boolean(mySeat && sideOf(entry.seat) !== sideOf(mySeat));
+    const hasRequested = Boolean(mySeat && entry.explanationRequestedBy?.includes(mySeat));
+    const anyOpponentAsked = (entry.explanationRequestedBy?.length || 0) > 0;
+    const hasExplanation = Boolean(entry.explanation);
+
+    return (
+      <div
+        className={`auction-bid-wrapper ${entry.alerted ? 'is-alerted' : ''} ${
+          anyOpponentAsked && !hasExplanation ? 'needs-explanation' : ''
+        }`}
+        onMouseEnter={(e) => {
+          if (hasExplanation && entry.explanation) {
+            openBidHoverPopover(e.currentTarget, hoverId, entry.seat, entry.explanation);
+          }
+        }}
+        onMouseLeave={() => {
+          setHoveredBidPopover((prev) => (prev?.key === hoverId ? null : prev));
+        }}
+        onClick={(e) => {
+          if (hasExplanation && entry.explanation) {
+            e.stopPropagation();
+            const target = e.currentTarget;
+            setHoveredBidPopover((prev) => {
+              if (prev?.key === hoverId) return null;
+              const rect = target.getBoundingClientRect();
+              const pSeat = partnerSeat(entry.seat);
+              return {
+                key: hoverId,
+                partnerName: displayNameForSeat(pSeat),
+                partnerSeat: pSeat,
+                explanation: entry.explanation!,
+                top: rect.top,
+                left: rect.left + rect.width / 2,
+              };
+            });
+          }
+        }}
+      >
+        <div className="auction-bid-main">
+          {renderColoredBidCall(entry.call)}
+          {entry.alerted && (
+            <span className="bid-alert-badge" title="Alerted by partner">
+              !
+            </span>
+          )}
+          {hasExplanation && (
+            <span className="bid-explained-badge" title="Hover to view explanation">
+              ?
+            </span>
+          )}
+        </div>
+
+        {(game?.phase === 'BIDDING' || game?.phase === 'PLAYING') && isPartner && (
+          <div className="bid-cell-actions">
+            {!entry.alerted && (
+              <button
+                type="button"
+                className="bid-mini-btn bid-alert-btn"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  alertPartnerBidCall(bidIndex);
+                }}
+                title="Alert partner's bid"
+              >
+                Alert
+              </button>
+            )}
+            <button
+              type="button"
+              className={`bid-mini-btn bid-explain-btn ${
+                anyOpponentAsked && !hasExplanation ? 'urgent' : ''
+              }`}
+              onClick={(e) => {
+                e.stopPropagation();
+                openPartnerExplainModal(bidIndex, entry.explanation);
+              }}
+              title="Explain partner's bid"
+            >
+              {hasExplanation ? 'Edit' : anyOpponentAsked ? 'Explain!' : 'Explain'}
+            </button>
+          </div>
+        )}
+
+        {(game?.phase === 'BIDDING' || game?.phase === 'PLAYING') &&
+          isOpponent &&
+          !hasExplanation && (
+            <div className="bid-cell-actions">
+              <button
+                type="button"
+                className="bid-mini-btn bid-ask-btn"
+                disabled={hasRequested}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  askForExplanation(bidIndex);
+                }}
+                title="Ask bidder's partner to explain this bid"
+              >
+                {hasRequested ? 'Asked' : 'Ask?'}
+              </button>
+            </div>
+          )}
+
+
+      </div>
+    );
+  };
 
   const vulClass = `vul-${(game?.vulnerability || 'NONE').toLowerCase()}`;
 
@@ -825,7 +1023,7 @@ export default function App() {
                   {auctionRows.map((row, rIdx) =>
                     row.map((cell, cIdx) => (
                       <div key={`${rIdx}-${cIdx}`} className="popover-cell">
-                        {cell ? renderColoredBidCall(cell.call) : ''}
+                        {renderAuctionCellContent(cell, 'popover')}
                       </div>
                     ))
                   )}
@@ -1083,7 +1281,7 @@ export default function App() {
                         <div key={rIdx} className="felt-auction-row">
                           {row.map((cell, cIdx) => (
                             <div key={cIdx} className="felt-auction-cell">
-                              {cell ? renderColoredBidCall(cell.call) : ''}
+                              {renderAuctionCellContent(cell, 'board')}
                             </div>
                           ))}
                         </div>
@@ -1162,7 +1360,6 @@ export default function App() {
                                   type: 'CONTRACT',
                                   level: selectedBidLevel,
                                   strain: st,
-                                  alert: alertText.trim() || undefined,
                                 })
                               }
                             >
@@ -1173,12 +1370,6 @@ export default function App() {
                             </button>
                           )
                         )}
-                        <input
-                          className="felt-alert-inline"
-                          value={alertText}
-                          onChange={(e) => setAlertText(e.target.value)}
-                          placeholder="Alert note..."
-                        />
                       </div>
                     )}
                   </div>
@@ -1260,6 +1451,78 @@ export default function App() {
               </div>
             </div>
           </>
+        )}
+
+        {pendingPartnerExplainRequests.length > 0 && game && (
+          <div className="partner-explain-banner">
+            <span>
+              Opponents asked you to explain partner&apos;s{' '}
+              <strong>
+                {renderColoredBidCall(pendingPartnerExplainRequests[0].entry.call)}
+              </strong>
+              :
+            </span>
+            <button
+              type="button"
+              className="claim-accept-btn"
+              onClick={() =>
+                openPartnerExplainModal(
+                  pendingPartnerExplainRequests[0].bidIndex,
+                  pendingPartnerExplainRequests[0].entry.explanation
+                )
+              }
+            >
+              Explain Bid
+            </button>
+          </div>
+        )}
+
+        {explainingBidIndex !== null && game && game.auction[explainingBidIndex] && (
+          <div className="felt-drawer-backdrop" onClick={() => setExplainingBidIndex(null)}>
+            <div className="felt-claim-modal" onClick={(e) => e.stopPropagation()}>
+              <h3>
+                Explain Partner&apos;s Bid ({game.auction[explainingBidIndex].seat}:{' '}
+                {renderColoredBidCall(game.auction[explainingBidIndex].call)})
+              </h3>
+              <p>
+                Provide the partnership agreement / meaning of this call for the opponents.
+              </p>
+              <input
+                type="text"
+                value={explanationInput}
+                onChange={(e) => setExplanationInput(e.target.value)}
+                placeholder="e.g. 15-17 balanced, Stayman, Jacoby transfer..."
+                className="felt-drawer-name-input"
+                autoFocus
+              />
+              <div className="claim-modal-btns" style={{ marginTop: 12 }}>
+                {!game.auction[explainingBidIndex].alerted && (
+                  <button
+                    type="button"
+                    className="claim-accept-btn"
+                    onClick={() => submitPartnerExplanation(true)}
+                  >
+                    Alert &amp; Save Explanation
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="claim-accept-btn"
+                  disabled={!explanationInput.trim()}
+                  onClick={() => submitPartnerExplanation(false)}
+                >
+                  Save Explanation
+                </button>
+                <button
+                  type="button"
+                  className="claim-cancel-btn"
+                  onClick={() => setExplainingBidIndex(null)}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
         )}
 
         {claimModalOpen && game && (
@@ -1432,6 +1695,24 @@ export default function App() {
           </div>
         )}
       </main>
+      {hoveredBidPopover && (
+        <div
+          className="bid-explanation-popover"
+          style={{
+            top: Math.max(10, hoveredBidPopover.top - 8),
+            left: Math.min(
+              Math.max(125, hoveredBidPopover.left),
+              typeof window !== 'undefined' ? window.innerWidth - 125 : hoveredBidPopover.left
+            ),
+          }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="bid-explanation-header">
+            Explanation by {hoveredBidPopover.partnerName} ({hoveredBidPopover.partnerSeat})
+          </div>
+          <div className="bid-explanation-body">{hoveredBidPopover.explanation}</div>
+        </div>
+      )}
     </div>
   );
 }

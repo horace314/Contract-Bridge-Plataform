@@ -5,14 +5,17 @@ import { Server } from 'socket.io';
 import { v4 as uuidv4 } from 'uuid';
 import { Pool } from 'pg';
 import {
+  alertPartnerBid,
   applyBid,
   applyPlayCard,
   BidCall,
   Card,
   createNewBoard,
+  explainPartnerBid,
   GameState,
   generatePBN,
   initiateClaim,
+  requestBidExplanation,
   respondToClaim,
   sanitizeStateForSeat,
   Seat,
@@ -226,6 +229,60 @@ io.on('connection', (socket) => {
     }
     broadcastRoomState(room);
   });
+
+  socket.on(
+    'alert_bid',
+    ({ tableId, bidIndex, explanation }: { tableId: string; bidIndex: number; explanation?: string }) => {
+      const room = rooms.get(tableId);
+      if (!room) return;
+      const seat = (['N', 'E', 'S', 'W'] as Seat[]).find((s) => room.seats[s]?.socketId === socket.id);
+      if (!seat) {
+        socket.emit('error_msg', 'Sit at a seat before alerting.');
+        return;
+      }
+      const result = alertPartnerBid(room.game, seat, bidIndex, explanation);
+      if (!result.ok) {
+        socket.emit('error_msg', result.error || 'Unable to alert bid.');
+        return;
+      }
+      broadcastRoomState(room);
+    }
+  );
+
+  socket.on('request_explanation', ({ tableId, bidIndex }: { tableId: string; bidIndex: number }) => {
+    const room = rooms.get(tableId);
+    if (!room) return;
+    const seat = (['N', 'E', 'S', 'W'] as Seat[]).find((s) => room.seats[s]?.socketId === socket.id);
+    if (!seat) {
+      socket.emit('error_msg', 'Sit at a seat before asking for an explanation.');
+      return;
+    }
+    const result = requestBidExplanation(room.game, seat, bidIndex);
+    if (!result.ok) {
+      socket.emit('error_msg', result.error || 'Unable to request explanation.');
+      return;
+    }
+    broadcastRoomState(room);
+  });
+
+  socket.on(
+    'explain_bid',
+    ({ tableId, bidIndex, explanation }: { tableId: string; bidIndex: number; explanation: string }) => {
+      const room = rooms.get(tableId);
+      if (!room) return;
+      const seat = (['N', 'E', 'S', 'W'] as Seat[]).find((s) => room.seats[s]?.socketId === socket.id);
+      if (!seat) {
+        socket.emit('error_msg', 'Sit at a seat before explaining a bid.');
+        return;
+      }
+      const result = explainPartnerBid(room.game, seat, bidIndex, explanation);
+      if (!result.ok) {
+        socket.emit('error_msg', result.error || 'Unable to submit explanation.');
+        return;
+      }
+      broadcastRoomState(room);
+    }
+  );
 
   socket.on('play_card', async ({ tableId, card }: { tableId: string; card: Card }) => {
     const room = rooms.get(tableId);

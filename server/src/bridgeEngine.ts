@@ -12,7 +12,15 @@ export type BidCall =
   | { type: 'PASS' }
   | { type: 'DOUBLE' }
   | { type: 'REDOUBLE' }
-  | { type: 'CONTRACT'; level: number; strain: Strain; alert?: string };
+  | { type: 'CONTRACT'; level: number; strain: Strain };
+
+export interface AuctionEntry {
+  seat: Seat;
+  call: BidCall;
+  alerted?: boolean;
+  explanation?: string;
+  explanationRequestedBy?: Seat[];
+}
 
 export interface Contract {
   level: number;
@@ -41,7 +49,7 @@ export interface GameState {
   phase: 'WAITING' | 'BIDDING' | 'PLAYING' | 'FINISHED';
   hands: Record<Seat, Card[]>;
   initialHands: Record<Seat, Card[]>;
-  auction: { seat: Seat; call: BidCall }[];
+  auction: AuctionEntry[];
   contract: Contract | null;
   dummy: Seat | null;
   dummyRevealed: boolean;
@@ -196,7 +204,13 @@ export function applyBid(state: GameState, seat: Seat, call: BidCall): { ok: boo
     return check;
   }
 
-  state.auction.push({ seat, call });
+  // Bidders cannot self-alert; strip any extra properties from call
+  const cleanCall: BidCall =
+    call.type === 'CONTRACT'
+      ? { type: 'CONTRACT', level: call.level, strain: call.strain }
+      : { type: call.type };
+
+  state.auction.push({ seat, call: cleanCall });
 
   const len = state.auction.length;
   if (
@@ -250,6 +264,83 @@ export function applyBid(state: GameState, seat: Seat, call: BidCall): { ok: boo
   }
 
   state.currentTurn = nextSeat(seat);
+  return { ok: true };
+}
+
+
+export function alertPartnerBid(
+  state: GameState,
+  actorSeat: Seat,
+  bidIndex: number,
+  explanation?: string
+): { ok: boolean; error?: string } {
+  if (state.phase !== 'BIDDING' && state.phase !== 'PLAYING') {
+    return { ok: false, error: 'Cannot alert bids after board finishes.' };
+  }
+  const entry = state.auction[bidIndex];
+  if (!entry) {
+    return { ok: false, error: 'Bid not found.' };
+  }
+  if (partnerSeat(entry.seat) !== actorSeat) {
+    return { ok: false, error: "You can only alert your partner's bid." };
+  }
+  entry.alerted = true;
+  if (explanation !== undefined) {
+    const trimmed = explanation.trim();
+    if (trimmed) {
+      entry.explanation = trimmed;
+      entry.explanationRequestedBy = [];
+    }
+  }
+  return { ok: true };
+}
+
+export function requestBidExplanation(
+  state: GameState,
+  actorSeat: Seat,
+  bidIndex: number
+): { ok: boolean; error?: string } {
+  if (state.phase !== 'BIDDING' && state.phase !== 'PLAYING') {
+    return { ok: false, error: 'Cannot request explanation after board finishes.' };
+  }
+  const entry = state.auction[bidIndex];
+  if (!entry) {
+    return { ok: false, error: 'Bid not found.' };
+  }
+  if (sideOf(entry.seat) === sideOf(actorSeat)) {
+    return { ok: false, error: 'Only opponents can ask for an explanation.' };
+  }
+  if (!entry.explanationRequestedBy) {
+    entry.explanationRequestedBy = [];
+  }
+  if (!entry.explanationRequestedBy.includes(actorSeat)) {
+    entry.explanationRequestedBy.push(actorSeat);
+  }
+  return { ok: true };
+}
+
+export function explainPartnerBid(
+  state: GameState,
+  actorSeat: Seat,
+  bidIndex: number,
+  explanation: string
+): { ok: boolean; error?: string } {
+  if (state.phase !== 'BIDDING' && state.phase !== 'PLAYING') {
+    return { ok: false, error: 'Cannot explain bids after board finishes.' };
+  }
+  const entry = state.auction[bidIndex];
+  if (!entry) {
+    return { ok: false, error: 'Bid not found.' };
+  }
+  if (partnerSeat(entry.seat) !== actorSeat) {
+    return { ok: false, error: "Only the bidder's partner can explain this bid." };
+  }
+  const trimmed = explanation.trim();
+  if (!trimmed) {
+    return { ok: false, error: 'Explanation cannot be empty.' };
+  }
+  entry.explanation = trimmed;
+  entry.explanationRequestedBy = [];
   return { ok: true };
 }
 

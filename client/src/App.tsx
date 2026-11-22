@@ -75,6 +75,15 @@ interface CompletedTrickRecord {
   cards: { seat: Seat; card: Card }[];
 }
 
+interface RoomSummary {
+  id: string;
+  hasPassword?: boolean;
+  boardNumber: number;
+  phase: string;
+  occupiedCount: number;
+  seats: Partial<Record<Seat, string>>;
+}
+
 interface CompletedBoardRecord {
   id: number;
   board_number: number;
@@ -592,11 +601,33 @@ function ReplaySuitHandBox({
 export default function App() {
   const [socket, setSocket] = useState<Socket | null>(null);
   const [connected, setConnected] = useState(false);
-  const [tableId, setTableId] = useState('main-room');
+  const [tableId, setTableId] = useState('');
+  const tableIdRef = useRef('');
+  const [roomPasswordInput, setRoomPasswordInput] = useState('');
+  const [showRoomPassword, setShowRoomPassword] = useState(false);
+  const [newRoomName, setNewRoomName] = useState('');
+  const [newRoomPassword, setNewRoomPassword] = useState('');
+  const [showNewRoomPassword, setShowNewRoomPassword] = useState(false);
+  const [newRoomSeat, setNewRoomSeat] = useState<Seat>('S');
+  const [availableRooms, setAvailableRooms] = useState<RoomSummary[]>([]);
+
+  useEffect(() => {
+    tableIdRef.current = tableId;
+  }, [tableId]);
+
+  const loadRooms = async () => {
+    try {
+      const res = await fetch(`${SERVER_URL}/api/rooms`);
+      const data = await res.json();
+      if (Array.isArray(data.rooms)) {
+        setAvailableRooms(data.rooms);
+      }
+    } catch {
+      // Ignore if endpoint unreachable
+    }
+  };
   const [selectedSeat, setSelectedSeat] = useState<Seat>('S');
-  const [playerNameInput, setPlayerNameInput] = useState(() => {
-    return localStorage.getItem('bridge_player_name') || '';
-  });
+  const [playerNameInput, setPlayerNameInput] = useState('');
   const [seatNames, setSeatNames] = useState<Partial<Record<Seat, string>>>({});
   const [mySeat, setMySeat] = useState<Seat | null>(null);
   const [game, setGame] = useState<GameState | null>(null);
@@ -711,6 +742,7 @@ export default function App() {
     s.on('connect', () => {
       setConnected(true);
       setErrorMsg('');
+      loadRooms();
     });
 
     s.on('disconnect', () => {
@@ -723,8 +755,12 @@ export default function App() {
     });
 
     s.on('table_state', (payload) => {
+      const activeRoomId = payload.tableId || tableIdRef.current;
+      if (payload.tableId && payload.tableId !== tableIdRef.current) {
+        setTableId(payload.tableId);
+      }
       if (payload.reconnectToken && payload.mySeat) {
-        localStorage.setItem(`bridge_token_${tableId}_${payload.mySeat}`, payload.reconnectToken);
+        localStorage.setItem(`bridge_token_${activeRoomId}_${payload.mySeat}`, payload.reconnectToken);
       }
       if (payload.seatNames) {
         setSeatNames(payload.seatNames);
@@ -732,7 +768,7 @@ export default function App() {
       if (Array.isArray(payload.chatMessages)) {
         setChatMessages(payload.chatMessages);
       }
-      if (payload.playerName) {
+      if (payload.playerName && payload.mySeat) {
         setPlayerNameInput(payload.playerName);
         localStorage.setItem('bridge_player_name', payload.playerName);
       }
@@ -766,6 +802,29 @@ export default function App() {
       }
     });
 
+    s.on('rooms_updated', (roomsList: RoomSummary[]) => {
+      if (Array.isArray(roomsList)) {
+        setAvailableRooms(roomsList);
+      }
+    });
+
+    s.on('left_table', () => {
+      setGame(null);
+      setMySeat(null);
+      setSeatNames({});
+      setDisplayedTrick([]);
+      setSelectedBidLevel(null);
+      setExplainingBidIndex(null);
+      setExplanationInput('');
+      setDrawerOpen(false);
+      setScoreModalOpen(false);
+      setClaimModalOpen(false);
+      setChatOpen(false);
+      setChatMessages([]);
+      setUnreadChatCount(0);
+      loadRooms();
+    });
+
     s.on('error_msg', (msg: string) => {
       setErrorMsg(msg);
     });
@@ -775,7 +834,6 @@ export default function App() {
     };
   }, []);
 
-  // Build replay entries capped at accepted claim when one exists
   const modalAcceptedClaim: AcceptedClaimRecord | null = historyModalBoard?.accepted_claim ?? null;
   const rawTricks: CompletedTrickRecord[] = historyModalBoard
     ? historyModalBoard.tricks_history && historyModalBoard.tricks_history.length > 0
@@ -863,6 +921,7 @@ export default function App() {
   }, [hoverLastTrickPopup, lastTrick]);
 
   const loadHistory = async (room: string) => {
+    if (!room.trim()) return;
     try {
       const res = await fetch(`${SERVER_URL}/api/boards/${encodeURIComponent(room)}`);
       const data = await res.json();
@@ -899,19 +958,51 @@ export default function App() {
     }
   }, [game?.phase, game?.score, game?.boardNumber, tableId, lastScoredBoardId]);
 
-  const joinSeat = (seat: Seat) => {
+  const joinSeat = (seat: Seat, targetRoomId?: string, passwordOverride?: string) => {
     if (!socket) return;
+    const chosenRoom = (targetRoomId ?? tableId).trim();
+    if (!chosenRoom) return;
+    if (chosenRoom !== tableId) {
+      setTableId(chosenRoom);
+    }
     const trimmedName = playerNameInput.trim() || `Player ${seat}`;
     localStorage.setItem('bridge_player_name', trimmedName);
-    const tokenKey = `bridge_token_${tableId}_${seat}`;
+    const tokenKey = `bridge_token_${chosenRoom}_${seat}`;
     const reconnectToken = localStorage.getItem(tokenKey) || undefined;
+    const effectivePassword =
+      passwordOverride !== undefined ? passwordOverride.trim() : roomPasswordInput.trim();
     socket.emit('join_table', {
-      tableId,
+      tableId: chosenRoom,
       seat,
       playerName: trimmedName,
+      password: effectivePassword || undefined,
       reconnectToken,
     });
     setDrawerOpen(false);
+    setTimeout(() => loadRooms(), 150);
+  };
+
+  const leaveTable = () => {
+    if (mySeat) {
+      localStorage.removeItem(`bridge_token_${tableId}_${mySeat}`);
+    }
+    if (socket?.connected) {
+      socket.emit('leave_table', { tableId });
+    }
+    setGame(null);
+    setMySeat(null);
+    setSeatNames({});
+    setDisplayedTrick([]);
+    setSelectedBidLevel(null);
+    setExplainingBidIndex(null);
+    setExplanationInput('');
+    setDrawerOpen(false);
+    setScoreModalOpen(false);
+    setClaimModalOpen(false);
+    setChatOpen(false);
+    setChatMessages([]);
+    setUnreadChatCount(0);
+    setTimeout(() => loadRooms(), 150);
   };
 
   const sendBid = (call: BidCall) => {
@@ -1257,7 +1348,6 @@ export default function App() {
     );
   };
 
-  // Helper to resolve initial hands & auction for a board in history modal
   const modalHands: Partial<Record<Seat, Card[]>> = historyModalBoard
     ? historyModalBoard.initial_hands &&
       Object.keys(historyModalBoard.initial_hands).length > 0
@@ -1290,7 +1380,6 @@ export default function App() {
     return rows;
   })();
 
-  // Set of cards played up to current trick / card step in replay mode
   const playedCardKeysUpToStep = new Set<string>();
   if (historyModalBoard && historyViewMode === 'play') {
     for (let t = 0; t < selectedTrickIdx; t++) {
@@ -1371,36 +1460,21 @@ export default function App() {
       ? history[(currentHistoryIdx + 1) % history.length]
       : null;
 
-  const cardPlayedBeforeClaim: { seat: Seat; card: Card } | null = (() => {
-    if (!modalAcceptedClaim || modalTricks.length === 0) return null;
-    if (modalAcceptedClaim.acceptedAtCard) {
-      return modalAcceptedClaim.acceptedAtCard;
-    }
-    const tIdx = Math.min(maxReplayTrickIdx, Math.max(0, modalTricks.length - 1));
-    const trickCards = modalTricks[tIdx]?.cards || [];
-    const maxStep = effectiveMaxStepForTrick(tIdx);
-    const stepIdx = maxStep > 0 ? Math.min(trickCards.length - 1, maxStep - 1) : -1;
-    if (stepIdx >= 0 && trickCards[stepIdx]) {
-      return trickCards[stepIdx];
-    }
-    for (let i = tIdx - 1; i >= 0; i--) {
-      const prevCards = modalTricks[i]?.cards || [];
-      if (prevCards.length > 0) {
-        return prevCards[prevCards.length - 1];
-      }
-    }
-    return null;
-  })();
-
   const vulClass = `vul-${(game?.vulnerability || 'NONE').toLowerCase()}`;
 
   return (
     <div className="felt-shell">
+      {game && (
       <aside className="felt-left-rail">
         <button
           type="button"
           className="rail-menu-btn"
-          onClick={() => setDrawerOpen((o) => !o)}
+          onClick={() => {
+            setDrawerOpen((o) => {
+              if (!o) loadRooms();
+              return !o;
+            });
+          }}
           title="Boards, Scoreboard & Room Settings"
         >
           ☰
@@ -1655,47 +1729,379 @@ export default function App() {
           </button>
         )}
       </aside>
+      )}
 
       <main className="felt-stage">
         {errorMsg && <div className="felt-toast-error">{errorMsg}</div>}
 
         {!game ? (
           <div className="felt-join-overlay">
-            <div className="felt-join-card">
+            <div
+              className="felt-join-card"
+              style={{ width: 'min(540px, 94vw)', maxHeight: '88vh', overflowY: 'auto' }}
+            >
               <h2>Contract Bridge Lobby</h2>
               <p className="felt-conn-status">
                 {connected ? '● Server Online (:3001)' : '○ Connecting to Server (:3001)...'}
               </p>
-              <div className="felt-lobby-form">
-                <input
-                  value={playerNameInput}
-                  onChange={(e) => setPlayerNameInput(e.target.value)}
-                  placeholder="Your display name"
-                  className="felt-name-input"
-                />
-                <div className="felt-join-row">
+
+              <div className="felt-lobby-form" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <div>
+                  <label style={{ display: 'block', fontSize: 12, opacity: 0.85, marginBottom: 4 }}>
+                    Display Name
+                  </label>
                   <input
-                    value={tableId}
-                    onChange={(e) => setTableId(e.target.value)}
-                    placeholder="Room ID"
+                    value={playerNameInput}
+                    onChange={(e) => setPlayerNameInput(e.target.value)}
+                    placeholder="Enter your name"
+                    className="felt-name-input"
+                    style={{ width: '100%' }}
                   />
-                  <select
-                    value={selectedSeat}
-                    onChange={(e) => setSelectedSeat(e.target.value as Seat)}
+                </div>
+
+                {/* Available Rooms List */}
+                <div
+                  style={{
+                    background: 'rgba(0, 0, 0, 0.26)',
+                    border: '1px solid rgba(255, 255, 255, 0.16)',
+                    borderRadius: 10,
+                    padding: 10,
+                  }}
+                >
+                  <div
+                    style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      marginBottom: 8,
+                      gap: 6,
+                    }}
                   >
-                    {SEATS.map((s) => (
-                      <option key={s} value={s}>
-                        Seat {s}
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    type="button"
-                    className="rail-claim-btn"
-                    onClick={() => joinSeat(selectedSeat)}
-                  >
-                    Sit Down
-                  </button>
+                    <strong style={{ fontSize: 13 }}>Available Rooms ({availableRooms.length})</strong>
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (socket?.connected) {
+                            socket.emit('cleanup_empty_rooms');
+                          } else {
+                            fetch(`${SERVER_URL}/api/rooms/cleanup`, { method: 'POST' })
+                              .then((r) => r.json())
+                              .then((d) => {
+                                if (Array.isArray(d.rooms)) {
+                                  setAvailableRooms(d.rooms);
+                                }
+                              })
+                              .catch(() => {});
+                          }
+                        }}
+                        title="Remove empty rooms"
+                        style={{
+                          fontSize: 11,
+                          padding: '3px 9px',
+                          borderRadius: 5,
+                          border: '1px solid rgba(255,255,255,0.25)',
+                          background: 'rgba(255,255,255,0.1)',
+                          color: '#fff',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        Clean Empty
+                      </button>
+                      <button
+                        type="button"
+                        onClick={loadRooms}
+                        style={{
+                          fontSize: 11,
+                          padding: '3px 10px',
+                          borderRadius: 5,
+                          border: '1px solid rgba(255,255,255,0.25)',
+                          background: 'rgba(255,255,255,0.1)',
+                          color: '#fff',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        ↻ Refresh
+                      </button>
+                    </div>
+                  </div>
+
+                  {availableRooms.length === 0 ? (
+                    <div
+                      style={{
+                        padding: '14px 12px',
+                        borderRadius: 8,
+                        border: '1px dashed rgba(255,255,255,0.22)',
+                        background: 'rgba(255,255,255,0.03)',
+                        textAlign: 'center',
+                        fontSize: 12.5,
+                        color: 'rgba(255,255,255,0.85)',
+                      }}
+                    >
+                      No active rooms right now. Create a room below to start a table.
+                    </div>
+                  ) : (
+                    <>
+                      <div
+                        style={{
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: 8,
+                          maxHeight: 230,
+                          overflowY: 'auto',
+                        }}
+                      >
+                        {availableRooms.map((r) => {
+                          const isSelected = tableId === r.id;
+                          return (
+                            <div
+                              key={r.id}
+                              onClick={() => setTableId(r.id)}
+                              style={{
+                                padding: '9px 11px',
+                                borderRadius: 8,
+                                border: isSelected
+                                  ? '2px solid #facc15'
+                                  : '1px solid rgba(255,255,255,0.16)',
+                                background: isSelected
+                                  ? 'rgba(250, 204, 21, 0.14)'
+                                  : 'rgba(255, 255, 255, 0.04)',
+                                cursor: 'pointer',
+                                transition: 'all 0.15s ease',
+                              }}
+                            >
+                              <div
+                                style={{
+                                  display: 'flex',
+                                  justifyContent: 'space-between',
+                                  alignItems: 'center',
+                                  marginBottom: 6,
+                                }}
+                              >
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                  <strong style={{ fontSize: 14, color: isSelected ? '#facc15' : '#fff' }}>
+                                    {r.id}
+                                  </strong>
+                                  {r.hasPassword && (
+                                    <span
+                                      title="Password protected"
+                                      style={{
+                                        fontSize: 11,
+                                        padding: '1px 6px',
+                                        borderRadius: 4,
+                                        background: 'rgba(234, 179, 8, 0.22)',
+                                        color: '#fde047',
+                                        border: '1px solid rgba(250, 204, 21, 0.4)',
+                                      }}
+                                    >
+                                      🔒 Locked
+                                    </span>
+                                  )}
+                                </div>
+                                <span style={{ fontSize: 12, opacity: 0.85 }}>
+                                  Board #{r.boardNumber} · {r.occupiedCount}/4 seated
+                                </span>
+                              </div>
+
+                              {/* Seat selector chips inside each room list item */}
+                              <div
+                                style={{
+                                  display: 'grid',
+                                  gridTemplateColumns: 'repeat(4, 1fr)',
+                                  gap: 5,
+                                }}
+                              >
+                                {SEATS.map((s) => {
+                                  const occupant = r.seats?.[s];
+                                  const seatSelected = isSelected && selectedSeat === s;
+                                  return (
+                                    <button
+                                      key={s}
+                                      type="button"
+                                      disabled={Boolean(occupant)}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setTableId(r.id);
+                                        setSelectedSeat(s);
+                                      }}
+                                      title={
+                                        occupant
+                                          ? `${SEAT_FULL_NAME[s]} occupied by ${occupant}`
+                                          : `Select ${SEAT_FULL_NAME[s]} (${s})`
+                                      }
+                                      style={{
+                                        padding: '4px 6px',
+                                        borderRadius: 5,
+                                        fontSize: 11,
+                                        border: seatSelected
+                                          ? '1.5px solid #facc15'
+                                          : '1px solid rgba(255,255,255,0.2)',
+                                        background: occupant
+                                          ? 'rgba(148, 163, 184, 0.16)'
+                                          : seatSelected
+                                          ? 'rgba(250, 204, 21, 0.28)'
+                                          : 'rgba(22, 101, 52, 0.55)',
+                                        color: occupant ? 'rgba(255,255,255,0.55)' : '#fff',
+                                        cursor: occupant ? 'not-allowed' : 'pointer',
+                                        whiteSpace: 'nowrap',
+                                        overflow: 'hidden',
+                                        textOverflow: 'ellipsis',
+                                      }}
+                                    >
+                                      <strong>{s}:</strong> {occupant || 'Open'}
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+
+                      {/* Join selected room controls */}
+                      <div
+                        style={{
+                          marginTop: 10,
+                          paddingTop: 10,
+                          borderTop: '1px solid rgba(255,255,255,0.14)',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: 8,
+                        }}
+                      >
+                        {availableRooms.find((r) => r.id === tableId)?.hasPassword && (
+                          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                            <input
+                              type={showRoomPassword ? 'text' : 'password'}
+                              value={roomPasswordInput}
+                              onChange={(e) => setRoomPasswordInput(e.target.value)}
+                              placeholder={`Password for "${tableId}"`}
+                              style={{ flex: 1 }}
+                            />
+                            <button
+                              type="button"
+                              onClick={() => setShowRoomPassword((v) => !v)}
+                              style={{
+                                padding: '6px 10px',
+                                borderRadius: 6,
+                                border: '1px solid rgba(255,255,255,0.25)',
+                                background: 'rgba(255,255,255,0.12)',
+                                color: '#fff',
+                                fontSize: 12,
+                                cursor: 'pointer',
+                                whiteSpace: 'nowrap',
+                              }}
+                            >
+                              {showRoomPassword ? 'Hide' : 'Show'}
+                            </button>
+                          </div>
+                        )}
+
+                        <div className="felt-join-row">
+                          <div style={{ flex: 1, fontSize: 12, opacity: 0.9 }}>
+                            Joining: <strong>{tableId || availableRooms[0]?.id}</strong>
+                          </div>
+                          <select
+                            value={selectedSeat}
+                            onChange={(e) => setSelectedSeat(e.target.value as Seat)}
+                          >
+                            {SEATS.map((s) => {
+                              const activeRoomObj = availableRooms.find(
+                                (r) => r.id === (tableId || availableRooms[0]?.id)
+                              );
+                              const occupant = activeRoomObj?.seats?.[s];
+                              return (
+                                <option key={s} value={s}>
+                                  Seat {s} ({SEAT_FULL_NAME[s]}){occupant ? ` · ${occupant}` : ' · Open'}
+                                </option>
+                              );
+                            })}
+                          </select>
+                          <button
+                            type="button"
+                            className="rail-claim-btn"
+                            onClick={() => joinSeat(selectedSeat, tableId || availableRooms[0]?.id)}
+                          >
+                            Join Room
+                          </button>
+                        </div>
+                      </div>
+                    </>
+                  )}
+                </div>
+
+                {/* Create New Room Section */}
+                <div
+                  style={{
+                    background: 'rgba(0, 0, 0, 0.22)',
+                    border: '1px solid rgba(255, 255, 255, 0.16)',
+                    borderRadius: 10,
+                    padding: 10,
+                    display: 'flex',
+                    flexDirection: 'column',
+                    gap: 8,
+                  }}
+                >
+                  <strong style={{ fontSize: 13 }}>Create a New Room</strong>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    <input
+                      value={newRoomName}
+                      onChange={(e) => setNewRoomName(e.target.value)}
+                      placeholder="New room name (e.g. friday-club)"
+                      style={{ flex: 1 }}
+                    />
+                    <select
+                      value={newRoomSeat}
+                      onChange={(e) => setNewRoomSeat(e.target.value as Seat)}
+                    >
+                      {SEATS.map((s) => (
+                        <option key={s} value={s}>
+                          Seat {s} ({SEAT_FULL_NAME[s]})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                    <input
+                      type={showNewRoomPassword ? 'text' : 'password'}
+                      value={newRoomPassword}
+                      onChange={(e) => setNewRoomPassword(e.target.value)}
+                      placeholder="Optional room password"
+                      style={{ flex: 1 }}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowNewRoomPassword((v) => !v)}
+                      style={{
+                        padding: '6px 10px',
+                        borderRadius: 6,
+                        border: '1px solid rgba(255,255,255,0.25)',
+                        background: 'rgba(255,255,255,0.12)',
+                        color: '#fff',
+                        fontSize: 12,
+                        cursor: 'pointer',
+                        whiteSpace: 'nowrap',
+                      }}
+                    >
+                      {showNewRoomPassword ? 'Hide' : 'Show'}
+                    </button>
+                    <button
+                      type="button"
+                      className="rail-claim-btn"
+                      disabled={!newRoomName.trim()}
+                      onClick={() => {
+                        const createdId = newRoomName.trim();
+                        if (!createdId) return;
+                        setTableId(createdId);
+                        setSelectedSeat(newRoomSeat);
+                        setRoomPasswordInput(newRoomPassword);
+                        joinSeat(newRoomSeat, createdId, newRoomPassword);
+                      }}
+                    >
+                      Create &amp; Sit
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -2155,8 +2561,6 @@ export default function App() {
               aria-label={`Board ${historyModalBoard.board_number} History`}
             >
               <div className="replay-top-bar">
-
-
                 <div className="replay-title-meta">
                   <strong>Board #{historyModalBoard.board_number}</strong> ·{' '}
                   {formatContractAndResult(historyModalBoard).contractLabel} (
@@ -2307,9 +2711,9 @@ export default function App() {
                             >
                               <span style={{ whiteSpace: 'pre-wrap' }}>
                                 <strong>{displayNameForSeat(modalAcceptedClaim.claimedBy)}</strong>
-                                {' claims '}
+                                {'\u00A0claims\u00A0'}
                                 <strong>{modalAcceptedClaim.claimedDeclarerTricks}</strong>
-                                {' total tricks accepted ('}
+                                {'\u00A0total\u00A0tricks\u00A0accepted\u00A0('}
                                 {historyModalBoard.score_ns >= 0
                                   ? `+${historyModalBoard.score_ns}`
                                   : historyModalBoard.score_ns}
@@ -2534,7 +2938,74 @@ export default function App() {
                   placeholder="Your display name"
                   className="felt-drawer-name-input"
                 />
-                <div className="felt-room-bar">
+
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 8 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: 12 }}>
+                    <span>Available Rooms</span>
+                    <button
+                      type="button"
+                      onClick={loadRooms}
+                      style={{ fontSize: 11, padding: '2px 8px', cursor: 'pointer' }}
+                    >
+                      Refresh
+                    </button>
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 5, maxHeight: 160, overflowY: 'auto' }}>
+                    {availableRooms.length === 0 ? (
+                      <div style={{ fontSize: 11.5, opacity: 0.8, padding: '6px 4px' }}>
+                        No active rooms. Create a room from the lobby.
+                      </div>
+                    ) : (
+                      availableRooms.map((r) => {
+                        const active = tableId === r.id;
+                        return (
+                          <button
+                            key={r.id}
+                            type="button"
+                            onClick={() => setTableId(r.id)}
+                            style={{
+                              display: 'flex',
+                              justifyContent: 'space-between',
+                              alignItems: 'center',
+                              padding: '6px 9px',
+                              borderRadius: 6,
+                              border: active ? '2px solid #facc15' : '1px solid rgba(255,255,255,0.22)',
+                              background: active ? 'rgba(250, 204, 21, 0.2)' : 'rgba(0,0,0,0.25)',
+                              color: '#fff',
+                              fontSize: 12,
+                              cursor: 'pointer',
+                              textAlign: 'left',
+                            }}
+                          >
+                            <span>
+                              {r.id} {r.hasPassword ? '🔒' : ''}
+                            </span>
+                            <span style={{ opacity: 0.8 }}>{r.occupiedCount}/4</span>
+                          </button>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+
+                <div style={{ display: 'flex', gap: 6, marginTop: 8 }}>
+                  <input
+                    type={showRoomPassword ? 'text' : 'password'}
+                    value={roomPasswordInput}
+                    onChange={(e) => setRoomPasswordInput(e.target.value)}
+                    placeholder="Room password (optional)"
+                    style={{ flex: 1 }}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowRoomPassword((v) => !v)}
+                    style={{ fontSize: 11, padding: '4px 8px', cursor: 'pointer' }}
+                  >
+                    {showRoomPassword ? 'Hide' : 'Show'}
+                  </button>
+                </div>
+
+                <div className="felt-room-bar" style={{ marginTop: 8 }}>
                   <input
                     value={tableId}
                     onChange={(e) => setTableId(e.target.value)}
@@ -2544,11 +3015,15 @@ export default function App() {
                     value={selectedSeat}
                     onChange={(e) => setSelectedSeat(e.target.value as Seat)}
                   >
-                    {SEATS.map((s) => (
-                      <option key={s} value={s}>
-                        {s}
-                      </option>
-                    ))}
+                    {SEATS.map((s) => {
+                      const activeRoomObj = availableRooms.find((r) => r.id === tableId);
+                      const occupant = activeRoomObj?.seats?.[s];
+                      return (
+                        <option key={s} value={s}>
+                          {s}{occupant ? ` (${occupant})` : ''}
+                        </option>
+                      );
+                    })}
                   </select>
                   <button
                     type="button"
@@ -2558,6 +3033,40 @@ export default function App() {
                     Sit
                   </button>
                 </div>
+
+                {game && (
+                  <div
+                    style={{
+                      marginTop: 12,
+                      paddingTop: 10,
+                      borderTop: '1px solid rgba(255, 255, 255, 0.16)',
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      gap: 8,
+                    }}
+                  >
+                    <span style={{ fontSize: 12, opacity: 0.85 }}>
+                      Room: <strong>{tableId}</strong>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={leaveTable}
+                      style={{
+                        padding: '6px 12px',
+                        borderRadius: 6,
+                        border: '1px solid rgba(248, 113, 113, 0.5)',
+                        background: 'rgba(220, 38, 38, 0.85)',
+                        color: '#ffffff',
+                        fontSize: 12,
+                        fontWeight: 600,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      Leave Table
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -2610,7 +3119,6 @@ export default function App() {
                             <td>{b.board_number}</td>
                             <td className="scorecard-result-cell">
                               <span>{info.compactResult}</span>
-
                             </td>
                             <td className="scorecard-pts-cell" style={{ textAlign: 'center' }}>
                               {b.score_ns > 0 ? b.score_ns : ''}

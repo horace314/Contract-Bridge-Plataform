@@ -30,6 +30,21 @@ const pool = process.env.DATABASE_URL
   ? new Pool({ connectionString: process.env.DATABASE_URL })
   : null;
 
+async function ensureBoardHistoryColumns() {
+  if (!pool) return;
+  try {
+    await pool.query(`
+      ALTER TABLE completed_boards
+      ADD COLUMN IF NOT EXISTS tricks_history JSONB,
+      ADD COLUMN IF NOT EXISTS initial_hands JSONB,
+      ADD COLUMN IF NOT EXISTS auction JSONB,
+      ADD COLUMN IF NOT EXISTS accepted_claim JSONB
+    `);
+  } catch {
+    // Table may not exist yet or user may lack ALTER privileges; handled gracefully on insert/select
+  }
+}
+
 interface SeatSession {
   socketId: string;
   token: string;
@@ -46,6 +61,7 @@ export interface ChatMessage {
 
 interface TableRoom {
   id: string;
+  password?: string;
   seats: Partial<Record<Seat, SeatSession>>;
   game: GameState;
   chatMessages: ChatMessage[];
@@ -54,11 +70,13 @@ interface TableRoom {
 const rooms = new Map<string, TableRoom>();
 const memoryBoards = new Map<string, any[]>();
 
-function getOrCreateRoom(tableId: string): TableRoom {
+function getOrCreateRoom(tableId: string, password?: string): TableRoom {
   let room = rooms.get(tableId);
   if (!room) {
+    const cleanPw = typeof password === 'string' && password.trim().length > 0 ? password.trim() : undefined;
     room = {
       id: tableId,
+      password: cleanPw,
       seats: {},
       game: createNewBoard(1),
       chatMessages: [],
@@ -66,6 +84,49 @@ function getOrCreateRoom(tableId: string): TableRoom {
     rooms.set(tableId, room);
   }
   return room;
+}
+
+function getOccupiedCount(room: TableRoom): number {
+  let count = 0;
+  for (const s of ['N', 'E', 'S', 'W'] as Seat[]) {
+    if (room.seats[s]?.playerName) {
+      count += 1;
+    }
+  }
+  return count;
+}
+
+function cleanupEmptyRooms(): string[] {
+  const removed: string[] = [];
+  for (const [roomId, room] of Array.from(rooms.entries())) {
+    const connectedInRoom = io.sockets.adapter.rooms.get(roomId)?.size ?? 0;
+    if (getOccupiedCount(room) === 0 && connectedInRoom === 0) {
+      rooms.delete(roomId);
+      removed.push(roomId);
+    }
+  }
+  return removed;
+}
+
+function buildRoomsList() {
+  return Array.from(rooms.entries()).map(([id, room]) => {
+    const seats: Partial<Record<Seat, string>> = {};
+    let occupiedCount = 0;
+    for (const s of ['N', 'E', 'S', 'W'] as Seat[]) {
+      if (room.seats[s]?.playerName) {
+        seats[s] = room.seats[s]!.playerName;
+        occupiedCount += 1;
+      }
+    }
+    return {
+      id,
+      hasPassword: Boolean(room.password),
+      boardNumber: room.game.boardNumber,
+      phase: room.game.phase,
+      occupiedCount,
+      seats,
+    };
+  });
 }
 
 async function persistCompletedBoard(tableId: string, game: GameState) {
@@ -102,8 +163,8 @@ async function persistCompletedBoard(tableId: string, game: GameState) {
     try {
       await pool.query(
         `INSERT INTO completed_boards
-         (table_id, board_number, dealer, vulnerability, contract_text, declarer, tricks_ns, tricks_ew, score_ns, score_ew, pbn)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+         (table_id, board_number, dealer, vulnerability, contract_text, declarer, tricks_ns, tricks_ew, score_ns, score_ew, tricks_history, initial_hands, auction, accepted_claim, pbn)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13::jsonb,$14::jsonb,$15)`,
         [
           tableId,
           record.board_number,
@@ -115,17 +176,53 @@ async function persistCompletedBoard(tableId: string, game: GameState) {
           record.tricks_ew,
           record.score_ns,
           record.score_ew,
+          JSON.stringify(record.tricks_history ?? []),
+          JSON.stringify(record.initial_hands ?? {}),
+          JSON.stringify(record.auction ?? []),
+          record.accepted_claim ? JSON.stringify(record.accepted_claim) : null,
           record.pbn,
         ]
       );
     } catch {
-      // Fallback to in-memory store
+      try {
+        await pool.query(
+          `INSERT INTO completed_boards
+           (table_id, board_number, dealer, vulnerability, contract_text, declarer, tricks_ns, tricks_ew, score_ns, score_ew, pbn)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+          [
+            tableId,
+            record.board_number,
+            record.dealer,
+            record.vulnerability,
+            record.contract_text,
+            record.declarer,
+            record.tricks_ns,
+            record.tricks_ew,
+            record.score_ns,
+            record.score_ew,
+            record.pbn,
+          ]
+        );
+      } catch {
+        // Fallback to in-memory store
+      }
     }
   }
 }
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true });
+});
+
+app.get('/api/rooms', (_req, res) => {
+  res.json({ rooms: buildRoomsList() });
+});
+
+app.post('/api/rooms/cleanup', (_req, res) => {
+  const removed = cleanupEmptyRooms();
+  const updatedList = buildRoomsList();
+  io.emit('rooms_updated', updatedList);
+  res.json({ removed, rooms: updatedList });
 });
 
 app.get('/api/boards/:tableId', async (req, res) => {
@@ -172,6 +269,7 @@ function broadcastRoomState(room: TableRoom) {
       }
     }
     io.to(sid).emit('table_state', {
+      tableId: room.id,
       mySeat: viewerSeat,
       playerName: viewerSeat ? room.seats[viewerSeat]?.playerName : undefined,
       seatNames,
@@ -188,24 +286,55 @@ io.on('connection', (socket) => {
       tableId,
       seat,
       playerName,
+      password,
       reconnectToken,
     }: {
       tableId: string;
       seat: Seat;
       playerName?: string;
+      password?: string;
       reconnectToken?: string;
     }) => {
-      const room = getOrCreateRoom(tableId);
-      socket.join(tableId);
+      const cleanTableId = (tableId || 'main-room').trim() || 'main-room';
+      const existingRoom = rooms.get(cleanTableId);
+      const existing = existingRoom?.seats[seat];
+      const isValidReconnect = Boolean(
+        existing && reconnectToken && existing.token === reconnectToken
+      );
 
-      const existing = room.seats[seat];
-      if (existing && existing.socketId !== socket.id) {
-        const oldSocketActive = io.sockets.sockets.has(existing.socketId);
-        if (oldSocketActive && existing.token !== reconnectToken) {
-          socket.emit('error_msg', `Seat ${seat} is already occupied in room ${tableId}.`);
+      if (existingRoom && existingRoom.password && !isValidReconnect) {
+        const supplied = typeof password === 'string' ? password.trim() : '';
+        if (supplied !== existingRoom.password) {
+          socket.emit('error_msg', `Incorrect password for room "${cleanTableId}".`);
           return;
         }
       }
+
+      if (existing && existing.socketId !== socket.id) {
+        const oldSocketActive = io.sockets.sockets.has(existing.socketId);
+        if (oldSocketActive && existing.token !== reconnectToken) {
+          socket.emit('error_msg', `Seat ${seat} is already occupied in room ${cleanTableId}.`);
+          return;
+        }
+      }
+
+      for (const joinedRoom of socket.rooms) {
+        if (joinedRoom !== socket.id && joinedRoom !== cleanTableId) {
+          socket.leave(joinedRoom);
+          const prevRoom = rooms.get(joinedRoom);
+          if (prevRoom) {
+            for (const s of ['N', 'E', 'S', 'W'] as Seat[]) {
+              if (prevRoom.seats[s]?.socketId === socket.id) {
+                delete prevRoom.seats[s];
+              }
+            }
+            broadcastRoomState(prevRoom);
+          }
+        }
+      }
+
+      const room = getOrCreateRoom(cleanTableId, password);
+      socket.join(cleanTableId);
 
       const token = reconnectToken || uuidv4();
       const trimmedName =
@@ -216,6 +345,7 @@ io.on('connection', (socket) => {
       room.seats[seat] = { socketId: socket.id, token, playerName: trimmedName };
 
       socket.emit('table_state', {
+        tableId: cleanTableId,
         mySeat: seat,
         playerName: trimmedName,
         seatNames: getSeatNames(room),
@@ -224,6 +354,7 @@ io.on('connection', (socket) => {
         game: sanitizeStateForSeat(room.game, seat),
       });
       broadcastRoomState(room);
+      io.emit('rooms_updated', buildRoomsList());
     }
   );
 
@@ -390,8 +521,49 @@ io.on('connection', (socket) => {
     room.game = createNewBoard(room.game.boardNumber + 1);
     broadcastRoomState(room);
   });
+
+  socket.on('leave_table', ({ tableId }: { tableId?: string }) => {
+    const roomsToLeave = new Set<string>();
+    if (tableId && typeof tableId === 'string') {
+      roomsToLeave.add(tableId);
+    }
+    for (const joinedRoom of socket.rooms) {
+      if (joinedRoom !== socket.id) {
+        roomsToLeave.add(joinedRoom);
+      }
+    }
+
+    for (const roomId of roomsToLeave) {
+      socket.leave(roomId);
+      const room = rooms.get(roomId);
+      if (room) {
+        for (const s of ['N', 'E', 'S', 'W'] as Seat[]) {
+          if (room.seats[s]?.socketId === socket.id) {
+            delete room.seats[s];
+          }
+        }
+        broadcastRoomState(room);
+      }
+    }
+
+    socket.emit('left_table');
+    io.emit('rooms_updated', buildRoomsList());
+  });
+
+  socket.on('cleanup_empty_rooms', () => {
+    const removed = cleanupEmptyRooms();
+    const updatedList = buildRoomsList();
+    io.emit('rooms_updated', updatedList);
+    socket.emit('empty_rooms_cleaned', { removed });
+  });
+
+  socket.on('disconnect', () => {
+    io.emit('rooms_updated', buildRoomsList());
+  });
 });
 
-server.listen(PORT, () => {
-  console.log(`Contract Bridge server running on port ${PORT}`);
+ensureBoardHistoryColumns().finally(() => {
+  server.listen(PORT, () => {
+    console.log(`Contract Bridge server running on port ${PORT}`);
+  });
 });

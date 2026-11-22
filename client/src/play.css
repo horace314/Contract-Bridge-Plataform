@@ -1,3 +1,7 @@
+/* ==========================================================================
+   Play Interface Styles
+   ========================================================================== */
+
 * {
   box-sizing: border-box;
 }
@@ -403,60 +407,6 @@ body {
   font-size: 0.85rem;
   font-weight: 600;
   z-index: 30;
-}
-
-.felt-join-overlay {
-  position: relative;
-  z-index: 10;
-  margin: auto;
-}
-
-.felt-join-card {
-  background: rgba(255, 255, 255, 0.96);
-  padding: 24px 28px;
-  border-radius: 10px;
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
-  text-align: center;
-  min-width: 340px;
-}
-
-.felt-join-card h2 {
-  margin: 0 0 6px 0;
-}
-
-.felt-conn-status {
-  margin: 0 0 14px 0;
-  font-size: 0.85rem;
-  color: #374151;
-}
-
-.felt-lobby-form {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-
-.felt-name-input {
-  width: 100%;
-  padding: 9px 12px;
-  border-radius: 6px;
-  border: 1px solid #9ca3af;
-  font-size: 0.95rem;
-  font-weight: 600;
-}
-
-.felt-join-row {
-  display: flex;
-  gap: 8px;
-  justify-content: center;
-}
-
-.felt-join-row input,
-.felt-join-row select {
-  padding: 8px 10px;
-  border-radius: 6px;
-  border: 1px solid #9ca3af;
-  font-size: 0.9rem;
 }
 
 .seat-zone-top {
@@ -1259,7 +1209,6 @@ body {
   font-size: 0.85rem;
 }
 
-
 /* ==========================================================================
    Mobile & Responsive Layout (<= 768px and <= 480px)
    ========================================================================== */
@@ -1297,7 +1246,6 @@ select {
     height: auto;
   }
 
-  /* Convert vertical left rail into a compact top utility bar on mobile */
   .felt-left-rail {
     position: sticky;
     top: 0;
@@ -1369,7 +1317,6 @@ select {
     flex-shrink: 0;
   }
 
-  /* Anchor popovers cleanly below the mobile top bar */
   .rail-hover-popover,
   .board-scores-popover,
   .contract-popover,
@@ -1391,7 +1338,6 @@ select {
     height: 152px;
   }
 
-  /* Stage allows vertical breathing room without clipping hands */
   .felt-stage {
     flex: 1 0 auto;
     width: 100%;
@@ -1420,33 +1366,6 @@ select {
     font-size: 0.8rem;
   }
 
-  .felt-join-overlay {
-    width: 100%;
-    padding: 8px 0;
-  }
-
-  .felt-join-card {
-    min-width: 0;
-    width: 100%;
-    max-width: 420px;
-    margin: 0 auto;
-    padding: 18px 16px;
-  }
-
-  .felt-join-row {
-    flex-wrap: wrap;
-  }
-
-  .felt-join-row input {
-    flex: 1 1 130px;
-    min-width: 0;
-  }
-
-  .felt-join-row select {
-    min-height: 38px;
-  }
-
-  /* Top / Dummy seat */
   .seat-zone-top {
     max-width: 100%;
     margin: 0 auto;
@@ -1491,7 +1410,6 @@ select {
     font-size: 0.72rem;
   }
 
-  /* Middle row stacks cleanly on narrow screens */
   .seat-zone-middle {
     flex-direction: column;
     align-items: stretch;
@@ -1551,7 +1469,6 @@ select {
     gap: 8px;
   }
 
-  /* Auction board & bidding panel on mobile */
   .felt-auction-board {
     width: 100%;
     min-height: 132px;
@@ -1613,7 +1530,6 @@ select {
     min-height: 36px;
   }
 
-  /* Trick stage on mobile */
   .felt-trick-stage {
     width: 220px;
     height: 176px;
@@ -1640,7 +1556,6 @@ select {
     font-size: 1.2rem;
   }
 
-  /* Bottom 13-card player hand strip */
   .seat-zone-bottom {
     max-width: 100%;
     margin-top: auto;
@@ -1683,7 +1598,6 @@ select {
     padding: 8px 10px;
   }
 
-  /* Full-width slide-over drawer on mobile */
   .felt-drawer-panel {
     margin-left: 0;
     width: 100%;
@@ -1749,7 +1663,6 @@ select {
     height: 72px;
   }
 }
-
 
 /* === Partner Alert & Opponent Explanation Popover Styles === */
 .auction-bid-wrapper {
@@ -1904,7 +1817,6 @@ select {
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25);
   font-size: 0.88rem;
 }
-
 
 /* === v1.1 In-Room Table Chat (All 4 Players) === */
 .rail-chat-btn {
@@ -2137,7 +2049,6 @@ select {
     z-index: 65;
   }
 }
-
 
 /* === v1.1 Board History Card-by-Card Modal (Scores Tab) === */
 .felt-hist-row {
@@ -2462,7 +2373,6 @@ select {
   }
 }
 
-
 /* === Scorecard Table (Board | Result | We | They) === */
 .scorecard-sheet-wrap {
   background: #d8d3b8;
@@ -2555,7 +2465,7 @@ select {
   font-weight: 800;
 }
 
-/* === Board History Replay Table (Screenshot 1, 2 & 3 Style) === */
+/* === Board History Replay Table === */
 .replay-table-modal {
   width: min(720px, 96vw);
   max-height: 92vh;
@@ -2807,8 +2717,6 @@ select {
   top: 50%;
   transform: translateY(-50%);
 }
-
-
 
 .replay-bottom-row {
   display: grid;

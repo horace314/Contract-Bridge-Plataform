@@ -326,13 +326,13 @@ function isLegalBidCall(auction: AuctionEntry[], seat: Seat, call: BidCall): boo
   let lastContract: { seat: Seat; level: number; strain: Strain } | null = null;
   let doubled: 0 | 1 | 2 = 0;
 
-  for (const entry of auction) {
-    if (entry.call.type === 'CONTRACT') {
-      lastContract = { seat: entry.seat, level: entry.call.level, strain: entry.call.strain };
+  for (const item of auction) {
+    if (item.call.type === 'CONTRACT') {
+      lastContract = { seat: item.seat, level: item.call.level, strain: item.call.strain };
       doubled = 0;
-    } else if (entry.call.type === 'DOUBLE') {
+    } else if (item.call.type === 'DOUBLE') {
       doubled = 1;
-    } else if (entry.call.type === 'REDOUBLE') {
+    } else if (item.call.type === 'REDOUBLE') {
       doubled = 2;
     }
   }
@@ -350,15 +350,20 @@ function isLegalBidCall(auction: AuctionEntry[], seat: Seat, call: BidCall): boo
   return STRAIN_ORDER.indexOf(call.strain) > STRAIN_ORDER.indexOf(lastContract.strain);
 }
 
+function countConsecutiveTrailingPasses(auction: AuctionEntry[]): number {
+  let passes = 0;
+  for (let i = auction.length - 1; i >= 0; i--) {
+    if (auction[i].call.type === 'PASS') passes += 1;
+    else break;
+  }
+  return passes;
+}
+
 function resolveAuction(auction: AuctionEntry[]): {
   finished: boolean;
   passedOut: boolean;
   contract: ContractSpec | null;
 } {
-  if (auction.length < 4) {
-    return { finished: false, passedOut: false, contract: null };
-  }
-
   let lastContractIdx = -1;
   for (let i = 0; i < auction.length; i++) {
     if (auction[i].call.type === 'CONTRACT') {
@@ -366,15 +371,17 @@ function resolveAuction(auction: AuctionEntry[]): {
     }
   }
 
+  const trailingPasses = countConsecutiveTrailingPasses(auction);
+
   if (lastContractIdx === -1) {
-    if (auction.length >= 4 && auction.slice(-4).every((e) => e.call.type === 'PASS')) {
+    if (auction.length >= 4 && trailingPasses >= 4) {
       return { finished: true, passedOut: true, contract: null };
     }
     return { finished: false, passedOut: false, contract: null };
   }
 
-  const trailingPasses = auction.slice(lastContractIdx + 1);
-  if (trailingPasses.length < 3 || !trailingPasses.every((e) => e.call.type === 'PASS')) {
+  // Auction ends after three consecutive passes following any contract/double/redouble
+  if (trailingPasses < 3) {
     return { finished: false, passedOut: false, contract: null };
   }
 
@@ -383,7 +390,8 @@ function resolveAuction(auction: AuctionEntry[]): {
   const winningSide = sideOf(contractEntry.seat);
 
   let declarer = contractEntry.seat;
-  for (const entry of auction) {
+  for (let i = lastContractIdx; i >= 0; i--) {
+    const entry = auction[i];
     if (
       entry.call.type === 'CONTRACT' &&
       sideOf(entry.seat) === winningSide &&
@@ -396,7 +404,8 @@ function resolveAuction(auction: AuctionEntry[]): {
 
   let doubled: 0 | 1 | 2 = 0;
   for (let i = lastContractIdx + 1; i < auction.length; i++) {
-    if (auction[i].call.type === 'DOUBLE') doubled = 1;
+    if (auction[i].call.type === 'CONTRACT') doubled = 0;
+    else if (auction[i].call.type === 'DOUBLE') doubled = 1;
     else if (auction[i].call.type === 'REDOUBLE') doubled = 2;
   }
 
@@ -703,6 +712,8 @@ function applyBid(room: RoomState, seat: Seat, call: BidCall): boolean {
 
   if (outcome.finished) {
     if (outcome.passedOut || !outcome.contract) {
+      g.contract = null;
+      g.dummy = null;
       finalizeBoard(room, null);
     } else {
       g.contract = outcome.contract;
@@ -955,7 +966,6 @@ io.on('connection', (socket: Socket) => {
 
       const room = getOrCreateRoom(roomId, providedPw || undefined);
 
-      // Detach socket from any previous room seats/spectator lists
       for (const r of rooms.values()) {
         r.spectatorSockets.delete(socket.id);
         r.spectatorHandModes.delete(socket.id);

@@ -389,8 +389,9 @@ function resolveAuction(auction: AuctionEntry[]): {
   const contractCall = contractEntry.call as Extract<BidCall, { type: 'CONTRACT' }>;
   const winningSide = sideOf(contractEntry.seat);
 
+  // Declarer is the FIRST player on the winning side to bid the final contract's strain
   let declarer = contractEntry.seat;
-  for (let i = lastContractIdx; i >= 0; i--) {
+  for (let i = 0; i <= lastContractIdx; i++) {
     const entry = auction[i];
     if (
       entry.call.type === 'CONTRACT' &&
